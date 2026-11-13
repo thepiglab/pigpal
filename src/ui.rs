@@ -2,53 +2,183 @@ use crate::{
     audio, export, media, model,
     recorder::Recorder,
     store::{self, Event, Root, Session},
+    theme::{self, *},
     transport::{Source, SourceConfig},
 };
 use anyhow::Result;
-use eframe::egui::{self, Color32, RichText, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, Margin, Pos2, Rangef, Rect, Response, RichText, Sense, Shape, Stroke,
+    Vec2,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, MutexGuard,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
-const TEAL: Color32 = Color32::from_rgb(30, 112, 94);
-const INK: Color32 = Color32::from_rgb(31, 43, 42);
-const PAPER: Color32 = Color32::from_rgb(248, 249, 247);
-const LINE: Color32 = Color32::from_rgb(222, 228, 224);
-const SOFT: Color32 = Color32::from_rgb(234, 241, 236);
-const MINT: Color32 = Color32::from_rgb(128, 232, 204);
-const MUTED: Color32 = Color32::from_rgb(105, 119, 113);
-#[derive(Default, Serialize, Deserialize)]
+/// Keeps a capture running independently of the window.
+///
+/// The recorder normally sits in `slot`, where a dedicated thread polls it every
+/// 20 ms: it reads the monitor connection, writes `wire.bin`, the journal and the
+/// live CSV, and syncs to disk each second. While a frame is being drawn the UI
+/// borrows the recorder out of the slot and returns it at the end of the frame.
+/// When the window is hidden, minimized or occluded and no frames are drawn, the
+/// background thread keeps capturing on its own.
+struct BackgroundCapture {
+    slot: Arc<Mutex<Option<Recorder>>>,
+    stop: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<String>>>,
+    thread: Option<JoinHandle<()>>,
+    /// Holds off App Nap and idle sleep for as long as the capture runs.
+    _activity: Option<crate::platform::Activity>,
+}
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+impl BackgroundCapture {
+    fn spawn() -> Self {
+        let slot: Arc<Mutex<Option<Recorder>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure: Arc<Mutex<Option<String>>> = Arc::default();
+        let (s, st, f) = (slot.clone(), stop.clone(), failure.clone());
+        let thread = std::thread::Builder::new()
+            .name("pigpal-capture".into())
+            .spawn(move || {
+                while !st.load(Ordering::Relaxed) {
+                    if lock(&f).is_none() {
+                        if let Some(rec) = lock(&s).as_mut() {
+                            if let Err(e) = rec.poll() {
+                                *lock(&f) = Some(format!("{e:#}"));
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+            .ok();
+        Self {
+            slot,
+            stop,
+            failure,
+            thread,
+            _activity: crate::platform::Activity::begin("Pig Pal is recording monitor data"),
+        }
+    }
+    fn take(&self) -> Option<Recorder> {
+        lock(&self.slot).take()
+    }
+    fn put(&self, rec: Recorder) {
+        *lock(&self.slot) = Some(rec);
+    }
+    fn failure(&self) -> Option<String> {
+        lock(&self.failure).take()
+    }
+    fn shutdown(mut self) -> Option<Recorder> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.take()
+    }
+}
+
+const SIDEBAR_WIDTH: f32 = 260.0;
+const RAIL_WIDTH: f32 = 300.0;
+const MAX_REVIEW_MESSAGES: usize = 50;
+/// Recording bookkeeping hidden from the review timeline unless asked for.
+const LIFECYCLE_KINDS: &[&str] = &["start", "stop", "connection", "disconnect"];
+
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Settings {
     source: SourceConfig,
     microphone: String,
     video_input: String,
+    /// Older settings files without this field open in System mode.
+    #[serde(default)]
+    appearance: Appearance,
 }
 enum Update {
     Progress(String),
     BinaryInspection(String, Box<crate::waveline::Inspection>),
+    Replay(String, Box<crate::replay::Capture>, Option<String>),
     Done(std::result::Result<String, String>),
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewTab {
+    Timeline,
+    Transcript,
+    Media,
+    Data,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonitorView {
+    Waveline,
+    Decoder,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Connection,
+    Audio,
+    Transcription,
+    Media,
+}
+impl SettingsTab {
+    const ALL: [(Self, Icon, &'static str); 5] = [
+        (Self::General, Icon::Settings, "General"),
+        (Self::Connection, Icon::Wave, "Monitor"),
+        (Self::Audio, Icon::Mic, "Audio"),
+        (Self::Transcription, Icon::Text, "Transcription"),
+        (Self::Media, Icon::Folder, "Video & photos"),
+    ];
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Warn,
+}
+struct Toast {
+    text: String,
+    kind: ToastKind,
+    until: Instant,
+}
+
 pub struct Desktop {
     root: Root,
     sessions: Vec<Session>,
     selected: Option<String>,
+    /// The active recorder while the UI holds it during a frame (see BackgroundCapture).
     recorder: Option<Recorder>,
+    capture: Option<BackgroundCapture>,
     settings: Settings,
+    /// Settings as they were when the dialog opened, restored on Cancel.
+    settings_saved: Settings,
     settings_open: bool,
+    settings_tab: SettingsTab,
     subject: String,
     title: String,
     authorized: bool,
     error: Option<String>,
-    notice: String,
-    review: VecDeque<Event>,
+    toasts: Vec<Toast>,
+    /// Latest progress text from the running background job.
+    progress: Option<String>,
+    devices_scanned: bool,
+    review: Vec<Event>,
+    review_messages: VecDeque<Event>,
+    review_tab: ReviewTab,
+    media_files: Vec<PathBuf>,
     transcripts: Vec<model::Transcript>,
     job: Option<Receiver<Update>>,
     note: String,
     note_anchor: Option<String>,
+    note_opened_at: f64,
     devices: Vec<String>,
     device_scan: Option<Receiver<std::result::Result<Vec<String>, String>>>,
     search: String,
@@ -56,33 +186,50 @@ pub struct Desktop {
     photo_path: String,
     photo_caption: String,
     close_confirm: bool,
+    resume_prompt: bool,
+    timeline_all: bool,
     waveform: crate::waveform::Waveform,
-    settings_tab: usize,
     binary_review: Option<crate::waveline::Inspection>,
-    waveline_monitor_view: bool,
+    monitor_view: MonitorView,
+    replay: Option<crate::replay_ui::Viewer>,
+    disk_free: Option<u64>,
+    disk_checked: Option<Instant>,
+    model_ready: bool,
 }
 impl Desktop {
     pub fn new(cc: &eframe::CreationContext<'_>, root: Root) -> Self {
         configure_style(&cc.egui_ctx);
-        let settings = store::read_json(&root.path.join("settings.json")).unwrap_or_default();
+        let settings: Settings =
+            store::read_json(&root.path.join("settings.json")).unwrap_or_default();
+        theme::set_appearance(&cc.egui_ctx, settings.appearance);
         let sessions = root.sessions().unwrap_or_default();
+        let model_ready = model::installed(&root.path);
         Self {
             root,
             sessions,
             selected: None,
             recorder: None,
+            capture: None,
+            settings_saved: settings.clone(),
             settings,
             settings_open: false,
+            settings_tab: SettingsTab::Connection,
             subject: String::new(),
             title: String::new(),
             authorized: false,
             error: None,
-            notice: "Everything is saved locally on this laptop.".into(),
-            review: VecDeque::new(),
+            toasts: Vec::new(),
+            progress: None,
+            devices_scanned: false,
+            review: Vec::new(),
+            review_messages: VecDeque::new(),
+            review_tab: ReviewTab::Timeline,
+            media_files: Vec::new(),
             transcripts: vec![],
             job: None,
             note: String::new(),
             note_anchor: None,
+            note_opened_at: 0.0,
             devices: vec![],
             device_scan: None,
             search: String::new(),
@@ -90,10 +237,15 @@ impl Desktop {
             photo_path: String::new(),
             photo_caption: String::new(),
             close_confirm: false,
+            resume_prompt: false,
+            timeline_all: false,
             waveform: Default::default(),
-            settings_tab: 0,
             binary_review: None,
-            waveline_monitor_view: false,
+            monitor_view: MonitorView::Waveline,
+            replay: None,
+            disk_free: None,
+            disk_checked: None,
+            model_ready,
         }
     }
     fn report<T>(&mut self, result: Result<T>) -> Option<T> {
@@ -111,25 +263,71 @@ impl Desktop {
             self.sessions = s;
         }
     }
+    fn busy(&self) -> bool {
+        self.recorder.is_some() || self.job.is_some()
+    }
     fn select(&mut self, id: String) {
         if self.selected.as_deref() != Some(&id) {
             self.binary_review = None;
+            self.replay = None;
+            self.resume_prompt = false;
+            self.review_tab = ReviewTab::Timeline;
         }
         self.selected = Some(id.clone());
         let dir = self.root.session_dir(&id);
-        let r = store::recent_events(&dir);
-        if let Some((events, warnings)) = self.report(r) {
-            self.review = events;
-            if !warnings.is_empty() {
-                self.notice = warnings.join("\n");
+        match store::review_events(&dir, MAX_REVIEW_MESSAGES) {
+            Ok(events) => {
+                self.review = events.timeline;
+                self.review_messages = events.messages;
+                if !events.warnings.is_empty() {
+                    self.toast_warn(events.warnings.join(" "));
+                }
             }
+            Err(e) => self.error = Some(format!("{e:#}")),
         }
         let r = model::transcripts(&dir);
         if let Some(t) = self.report(r) {
             self.transcripts = t;
         }
+        // Cached once per selection instead of walking the folder every frame.
+        self.media_files = walkdir::WalkDir::new(dir.join("segments"))
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().is_file()
+                    && matches!(
+                        e.path()
+                            .extension()
+                            .and_then(|x| x.to_str())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref(),
+                        Some("wav" | "mkv" | "jpg" | "png" | "jpeg")
+                    )
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        self.media_files.sort();
+        self.model_ready = model::installed(&self.root.path);
+    }
+    pub fn open_replay(&mut self, id: String, at: Option<String>) {
+        if self.busy() {
+            return;
+        }
+        self.select(id.clone());
+        let folder = self.root.session_dir(&id);
+        self.progress = Some("Loading the replay…".into());
+        self.job(move |tx| {
+            let capture = crate::replay::Capture::load(&folder)?;
+            let count = capture.frames.len();
+            let _ = tx.send(Update::Replay(id, Box::new(capture), at));
+            Ok(format!(
+                "Replay ready · {count} raw records decoded · original files unchanged"
+            ))
+        });
     }
     fn start(&mut self, resume: Option<Session>) {
+        self.replay = None;
+        self.resume_prompt = false;
         let mut config = self.settings.source.clone();
         let session = if let Some(s) = resume {
             if s.synthetic {
@@ -137,9 +335,11 @@ impl Desktop {
             }
             s
         } else {
-            let r = self
-                .root
-                .create(&self.subject, &self.title, config.mode == Source::Demo);
+            let r = self.root.create(
+                self.subject.trim(),
+                self.title.trim(),
+                config.mode == Source::Demo,
+            );
             let Some(s) = self.report(r) else {
                 return;
             };
@@ -149,14 +349,39 @@ impl Desktop {
         if let Some(rec) = self.report(r) {
             self.selected = Some(rec.session.id.clone());
             self.recorder = Some(rec);
+            self.capture = Some(BackgroundCapture::spawn());
             self.waveform.clear();
             self.authorized = false;
             self.note_anchor = None;
-            self.notice = "Recording. Microphone starts only when you enable it.".into();
+            self.toast("Recording started");
             self.refresh();
         }
     }
+    /// Bring the recorder into the UI for this frame and surface background errors.
+    fn reclaim(&mut self) {
+        let Some(capture) = &self.capture else {
+            return;
+        };
+        if self.recorder.is_none() {
+            self.recorder = capture.take();
+        }
+        if let Some(error) = capture.failure() {
+            self.error = Some(format!("Capture interrupted: {error}"));
+            self.stop(true);
+        }
+    }
+    /// Hand the recorder back to the background thread at the end of a frame.
+    fn park(&mut self) {
+        if let (Some(capture), Some(rec)) = (&self.capture, self.recorder.take()) {
+            capture.put(rec);
+        }
+    }
     fn stop(&mut self, interrupted: bool) {
+        if let Some(capture) = self.capture.take() {
+            if let Some(rec) = capture.shutdown() {
+                self.recorder = Some(rec);
+            }
+        }
         if let Some(mut rec) = self.recorder.take() {
             let id = rec.session.id.clone();
             let r = rec.stop(&self.root, interrupted);
@@ -164,7 +389,9 @@ impl Desktop {
             self.note_anchor = None;
             self.refresh();
             self.select(id);
-            self.notice = "Capture saved. Review, transcribe, or export below.".into();
+            self.toast("Recording saved");
+            self.subject.clear();
+            self.title.clear();
         }
     }
     fn job(&mut self, f: impl FnOnce(Sender<Update>) -> Result<String> + Send + 'static) {
@@ -176,6 +403,9 @@ impl Desktop {
         });
     }
     fn tick(&mut self) {
+        if let Some(replay) = &mut self.replay {
+            replay.tick();
+        }
         if let Some(result) = self.device_scan.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.device_scan = None;
             match result {
@@ -197,25 +427,48 @@ impl Desktop {
         loop {
             let update = self.job.as_ref().and_then(|rx| rx.try_recv().ok());
             match update {
-                Some(Update::Progress(p)) => self.notice = p,
+                Some(Update::Progress(p)) => self.progress = Some(p),
                 Some(Update::BinaryInspection(id, inspection)) => {
                     if self.selected.as_deref() == Some(&id) {
                         self.binary_review = Some(*inspection);
+                        self.review_tab = ReviewTab::Data;
+                    }
+                }
+                Some(Update::Replay(id, capture, at)) => {
+                    if self.selected.as_deref() == Some(&id) {
+                        self.replay = Some(crate::replay_ui::Viewer::new(
+                            *capture,
+                            at.as_deref(),
+                            replay_notes(&self.review),
+                        ));
                     }
                 }
                 Some(Update::Done(result)) => {
                     self.job = None;
+                    self.progress = None;
                     match result {
-                        Ok(msg) => self.notice = msg,
+                        Ok(msg) => self.toast(msg),
                         Err(e) => self.error = Some(e),
                     };
                     if let Some(id) = self.selected.clone() {
-                        self.select(id);
+                        if self.recorder.is_none() {
+                            self.select(id);
+                        }
                     }
+                    self.model_ready = model::installed(&self.root.path);
+                    self.disk_checked = None;
                     break;
                 }
                 None => break,
             }
+        }
+        // Free space changes slowly; check at most every five seconds.
+        if self
+            .disk_checked
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
+        {
+            self.disk_free = fs2::available_space(&self.root.path).ok();
+            self.disk_checked = Some(Instant::now());
         }
     }
     fn scan_devices(&mut self) {
@@ -228,1034 +481,927 @@ impl Desktop {
             let _ = tx.send(audio::Microphone::devices().map_err(|e| format!("{e:#}")));
         });
     }
-    fn open_settings(&mut self, tab: usize) {
+    fn open_settings(&mut self, tab: SettingsTab) {
         self.settings_tab = tab;
+        if !self.settings_open {
+            self.settings_saved = self.settings.clone();
+        }
         self.settings_open = true;
         self.scan_devices();
     }
+    fn new_session_view(&mut self) {
+        self.selected = None;
+        self.replay = None;
+        self.authorized = false;
+        self.resume_prompt = false;
+    }
+
+    fn inspect_binary(&mut self, id: &str, dir: &std::path::Path) {
+        let folder = dir.to_path_buf();
+        let id = id.to_string();
+        self.progress = Some("Inspecting saved binary records…".into());
+        self.job(move |tx| {
+            let inspection = crate::waveline::inspect_session(&folder)?;
+            let count = inspection.records;
+            let _ = tx.send(Update::BinaryInspection(id, Box::new(inspection)));
+            Ok(format!(
+                "Inspected {count} experimental binary records. Field mappings remain unverified."
+            ))
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifications and settings persistence
+
+    fn toast(&mut self, text: impl Into<String>) {
+        self.push_toast(text.into(), ToastKind::Info);
+    }
+    fn toast_warn(&mut self, text: impl Into<String>) {
+        self.push_toast(text.into(), ToastKind::Warn);
+    }
+    fn push_toast(&mut self, text: String, kind: ToastKind) {
+        self.toasts.retain(|t| t.text != text);
+        self.toasts.push(Toast {
+            text,
+            kind,
+            until: Instant::now()
+                + Duration::from_secs(if kind == ToastKind::Warn { 8 } else { 4 }),
+        });
+        if self.toasts.len() > 3 {
+            self.toasts.remove(0);
+        }
+    }
+    /// Save choices made outside the Settings dialog (appearance, quick pickers)
+    /// without committing anything still being edited inside it.
+    fn persist(&mut self, edit: impl Fn(&mut Settings)) {
+        edit(&mut self.settings);
+        edit(&mut self.settings_saved);
+        let r = store::write_json(&self.root.path.join("settings.json"), &self.settings_saved);
+        self.report(r);
+    }
+    fn set_appearance(&mut self, ctx: &egui::Context, appearance: Appearance) {
+        theme::set_appearance(ctx, appearance);
+        self.persist(|s| s.appearance = appearance);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sidebar
+
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("library")
             .resizable(false)
-            .exact_width(248.0)
+            .exact_width(SIDEBAR_WIDTH)
+            .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(239, 242, 238))
-                    .inner_margin(20),
+                    .fill(sidebar())
+                    .inner_margin(Margin::symmetric(12, 16)),
             )
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(Vec2::splat(32.0), egui::Sense::hover());
-                    ui.painter().rect_filled(r, 9, TEAL);
-                    for (i, h) in [8.0, 17.0, 11.0, 21.0, 8.0].iter().enumerate() {
-                        let x = r.left() + 8.0 + i as f32 * 4.0;
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(x, r.center().y - h / 2.0),
-                                egui::pos2(x, r.center().y + h / 2.0),
-                            ],
-                            egui::Stroke::new(2.0, Color32::WHITE),
-                        );
-                    }
-                    ui.label(semibold("Pig Pal", 17.0));
-                });
-                ui.add_space(24.0);
-                if ui
-                    .add_enabled(
-                        self.recorder.is_none() && self.job.is_none(),
-                        primary("+  New session").min_size(Vec2::new(ui.available_width(), 42.0)),
-                    )
+                let edge = ui.max_rect().right() + 12.0;
+                ui.ctx().layer_painter(egui::LayerId::background()).vline(
+                    edge,
+                    ui.ctx().screen_rect().y_range(),
+                    Stroke::new(1.0, line()),
+                );
+                ui.spacing_mut().item_spacing.y = 0.0;
+
+                // Brand
+                let (row, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+                let mark = Rect::from_min_size(
+                    Pos2::new(row.left() + 4.0, row.top() + 1.0),
+                    Vec2::splat(28.0),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(mark, 8, accent());
+                paint_icon(painter, mark.shrink(5.0), Icon::Wave, on_accent());
+                let f = bold(15.0);
+                let b = centered_baseline(painter, &f, mark.center().y);
+                paint_on_baseline(
+                    painter,
+                    painter.layout_no_wrap("Pig Pal".into(), f, text()),
+                    mark.right() + 10.0,
+                    b,
+                );
+                ui.add_space(20.0);
+
+                // Primary action or the live recording card
+                if let Some(rec) = &self.recorder {
+                    parts::recording_card(ui, rec);
+                } else if Btn::primary("New recording")
+                    .icon(Icon::Plus)
+                    .width(ui.available_width())
+                    .enabled(self.job.is_none())
+                    .show(ui)
                     .clicked()
                 {
-                    self.selected = None;
-                    self.authorized = false;
+                    self.new_session_view();
                 }
-                ui.add_space(22.0);
-                eyebrow(ui, "SESSION LIBRARY");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .margin(Vec2::new(10.0, 10.0))
-                        .hint_text("Search sessions…")
-                        .desired_width(f32::INFINITY),
+                ui.add_space(12.0);
+                text_field(
+                    ui,
+                    "session_search",
+                    &mut self.search,
+                    "Search sessions",
+                    Some(Icon::Search),
                 );
-                ui.add_space(10.0);
+                ui.add_space(20.0);
+
+                let needle = self.search.trim().to_lowercase();
+                let matches: Vec<usize> = self
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        needle.is_empty()
+                            || s.subject.to_lowercase().contains(&needle)
+                            || s.title.to_lowercase().contains(&needle)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                parts::list_heading(ui, "Sessions", matches.len());
+                ui.add_space(4.0);
+
+                let footer = 52.0;
                 let mut selection = None;
+                let enabled = !self.busy();
                 egui::ScrollArea::vertical()
                     .id_salt("sessions")
-                    .max_height((ui.available_height() - 138.0).max(60.0))
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - footer).max(60.0))
                     .show(ui, |ui| {
-                        let mut count = 0;
-                        for s in &self.sessions {
-                            if !format!("{} {}", s.subject, s.title)
-                                .to_lowercase()
-                                .contains(&self.search.to_lowercase())
-                            {
-                                continue;
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for &i in &matches {
+                            let s = &self.sessions[i];
+                            let is_selected = self.selected.as_ref() == Some(&s.id);
+                            if parts::session_row(ui, s, is_selected, enabled).clicked() {
+                                selection = Some(s.id.clone());
                             }
-                            count += 1;
-                            let selected = self.selected.as_ref() == Some(&s.id);
-                            let fill = if selected {
-                                Color32::WHITE
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let response = egui::Frame::new()
-                                .fill(fill)
-                                .corner_radius(10)
-                                .inner_margin(12)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    if ui
-                                        .add_enabled(
-                                            self.recorder.is_none() && self.job.is_none(),
-                                            egui::Button::new(
-                                                semibold(&s.title, 13.0).color(if selected {
-                                                    TEAL
-                                                } else {
-                                                    INK
-                                                }),
-                                            )
-                                            .frame(false)
-                                            .wrap()
-                                            .min_size(Vec2::new(ui.available_width(), 32.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        selection = Some(s.id.clone());
-                                    }
-                                    ui.label(RichText::new(&s.subject).size(11.0).color(MUTED));
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{}  ·  {}",
-                                            s.created.with_timezone(&chrono::Local).format("%b %d"),
-                                            if s.synthetic { "Demo" } else { &s.state }
-                                        ))
-                                        .size(11.0)
-                                        .color(MUTED),
-                                    );
-                                })
-                                .response;
-                            if selected {
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_size(
-                                        response.rect.left_top() + Vec2::new(0.0, 12.0),
-                                        Vec2::new(3.0, response.rect.height() - 24.0),
-                                    ),
-                                    2,
-                                    TEAL,
-                                );
-                            }
-                            ui.add_space(4.0);
                         }
-                        if count == 0 {
-                            ui.label(
-                                RichText::new(if self.sessions.is_empty() {
-                                    "Your saved sessions will appear here."
+                        if matches.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(muted_text(
+                                if self.sessions.is_empty() {
+                                    "Recordings you save appear here."
                                 } else {
-                                    "No matching sessions."
-                                })
-                                .size(12.0)
-                                .color(MUTED),
-                            );
+                                    "No sessions match."
+                                },
+                                12.5,
+                            ));
                         }
                     });
                 if let Some(id) = selection {
                     self.select(id);
                 }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.label(RichText::new("LOCAL WORKSPACE").size(10.0).color(MUTED));
-                    ui.add_space(8.0);
-                    if ui
-                        .add(
-                            egui::Button::new("Settings")
-                                .frame(false)
-                                .min_size(Vec2::new(ui.available_width(), 40.0)),
-                        )
-                        .clicked()
-                    {
-                        self.open_settings(0);
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new("Open data folder")
-                                .frame(false)
-                                .min_size(Vec2::new(ui.available_width(), 40.0)),
-                        )
-                        .clicked()
-                    {
-                        let r = open::that(&self.root.path).map_err(Into::into);
-                        self.report(r);
-                    }
-                    ui.separator();
-                });
-            });
-    }
-    fn new_session(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-        eyebrow(ui, "WORKSPACE  /  NEW SESSION");
-        ui.add_space(18.0);
-        ui.label(semibold("New session", 34.0));
-        ui.label(RichText::new("Set up a recording for this subject and session.").color(MUTED));
-        ui.add_space(28.0);
-        surface().show(ui, |ui| {
-            ui.set_width(ui.available_width().min(660.0));
-            ui.label(semibold("Session details", 17.0));
-            ui.add_space(16.0);
-            ui.columns(2, |cols| {
-                cols[0].label(semibold("Subject / research ID", 12.0));
-                cols[0].add(
-                    egui::TextEdit::singleline(&mut self.subject)
-                        .margin(Vec2::new(10.0, 10.0))
-                        .hint_text("Subject 001")
-                        .desired_width(f32::INFINITY),
+
+                // Footer: storage on the left, utilities on the right.
+                let rect = Rect::from_min_max(
+                    Pos2::new(ui.max_rect().left(), ui.max_rect().bottom() - 40.0),
+                    ui.max_rect().right_bottom(),
                 );
-                cols[1].label(semibold("Session title", 12.0));
-                cols[1].add(
-                    egui::TextEdit::singleline(&mut self.title)
-                        .margin(Vec2::new(10.0, 10.0))
-                        .hint_text("Baseline & intervention")
-                        .desired_width(f32::INFINITY),
+                ui.painter().hline(
+                    rect.x_range().expand(12.0),
+                    rect.top() - 8.0,
+                    Stroke::new(1.0, line()),
                 );
-            });
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(14.0);
-            ui.label(semibold("Monitor input", 12.0));
-            ui.horizontal_wrapped(|ui| {
-                source_combo(ui, &mut self.settings.source.mode);
-                if ui.button("Configure input").clicked() {
-                    self.open_settings(0);
+                let mut appearance = self.settings.appearance;
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if let Some(bytes) = self.disk_free {
+                            ui.add_space(4.0);
+                            ui.label(muted_text(format!("{} free", format_bytes(bytes)), 12.0))
+                                .on_hover_text(
+                                    "Free space on the drive that holds your recordings",
+                                );
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if icon_button(ui, Icon::Settings, "Settings").clicked() {
+                                self.open_settings(SettingsTab::General);
+                            }
+                            if icon_button(ui, Icon::Folder, "Open data folder").clicked() {
+                                let r = open::that(&self.root.path).map_err(Into::into);
+                                self.report(r);
+                            }
+                            let theme_button = icon_button(
+                                ui,
+                                self.settings.appearance.icon(),
+                                &format!("Appearance: {}", self.settings.appearance.label()),
+                            );
+                            menu_above(ui, "appearance_menu", &theme_button, 190.0, |ui| {
+                                for option in Appearance::ALL {
+                                    if menu_item(
+                                        ui,
+                                        Some(option.icon()),
+                                        option.label(),
+                                        None,
+                                        appearance == option,
+                                    )
+                                    .clicked()
+                                    {
+                                        appearance = option;
+                                    }
+                                }
+                            });
+                        });
+                    },
+                );
+                if appearance != self.settings.appearance {
+                    self.set_appearance(ui.ctx(), appearance);
                 }
             });
-            ui.label(
-                RichText::new(if self.settings.source.mode == Source::Demo {
-                    "Synthetic demo · generated measurements, no monitor connection."
-                } else {
-                    "Use the connection settings confirmed for your monitor."
-                })
-                .size(12.0)
-                .color(MUTED),
-            );
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                status_dot(ui, TEAL);
-                ui.label(
-                    RichText::new("Audio is optional. Enable the microphone after starting.")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            });
-            ui.add_space(24.0);
-            ui.checkbox(
-                &mut self.authorized,
-                "I am authorized to record this session",
-            );
-            ui.add_space(12.0);
-            if ui
-                .add_enabled(
-                    self.authorized
-                        && !self.subject.trim().is_empty()
-                        && !self.title.trim().is_empty()
-                        && self.job.is_none(),
-                    primary("Start session").min_size(Vec2::new(180.0, 44.0)),
-                )
-                .clicked()
-            {
-                self.start(None);
-            }
-        });
-        ui.add_space(28.0);
-        ui.horizontal(|ui| {
-            status_dot(ui, TEAL);
-            ui.label(semibold(
-                if model::installed(&self.root.path) {
-                    "Offline transcription ready"
-                } else {
-                    "Your data stays on this laptop"
-                },
-                12.0,
-            ));
-        });
-        ui.label(RichText::new("Save a session to review its audio, read transcripts, and export everything together.").size(12.0).color(MUTED));
     }
-    fn live(&mut self, ui: &mut egui::Ui) {
-        let rec = self.recorder.as_ref().unwrap();
-        ui.horizontal(|ui| {
-            status_dot(ui, TEAL);
-            eyebrow(ui, "SESSION IN PROGRESS");
-            if rec.session.synthetic {
-                badge(ui, "SYNTHETIC DEMO");
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format_time(rec.journal.elapsed()))
-                        .monospace()
-                        .size(19.0)
-                        .color(INK),
+
+    // -----------------------------------------------------------------------
+    // Dialogs
+
+    fn settings(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let mut save = false;
+        let response = egui::Modal::new(egui::Id::new("settings"))
+            .frame(modal_frame().inner_margin(Margin::ZERO))
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let size = Vec2::new(760.0, 540.0);
+                let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+                let nav = Rect::from_min_size(rect.min, Vec2::new(200.0, size.y));
+                ui.painter().rect_filled(
+                    nav,
+                    egui::CornerRadius {
+                        nw: 14,
+                        sw: 14,
+                        ne: 0,
+                        se: 0,
+                    },
+                    sidebar(),
+                );
+                ui.painter()
+                    .vline(nav.right(), nav.y_range(), Stroke::new(1.0, line()));
+
+                // Navigation
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new().max_rect(nav.shrink2(Vec2::new(12.0, 20.0))),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(semibold("Settings", 16.0));
+                        });
+                        ui.add_space(14.0);
+                        for (tab, icon, label) in SettingsTab::ALL {
+                            if parts::nav_item(ui, icon, label, self.settings_tab == tab).clicked()
+                            {
+                                self.settings_tab = tab;
+                            }
+                        }
+                    },
+                );
+
+                // Content
+                let content = Rect::from_min_max(
+                    Pos2::new(nav.right() + 28.0, rect.top() + 24.0),
+                    Pos2::new(rect.right() - 28.0, rect.bottom() - 76.0),
+                );
+                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings_content")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.settings_content(ui));
+                });
+
+                // Footer
+                let footer =
+                    Rect::from_min_max(Pos2::new(nav.right(), rect.bottom() - 64.0), rect.max);
+                ui.painter()
+                    .hline(footer.x_range(), footer.top(), Stroke::new(1.0, line()));
+                ui.allocate_new_ui(
+                    egui::UiBuilder::new()
+                        .max_rect(footer.shrink2(Vec2::new(24.0, 16.0)))
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    |ui| {
+                        save = Btn::primary("Save changes").show(ui).clicked();
+                        close = Btn::ghost("Cancel").show(ui).clicked();
+                    },
                 );
             });
-        });
-        ui.add_space(12.0);
-        ui.label(semibold(&rec.session.title, 30.0));
-        ui.label(
-            RichText::new(format!(
-                "{}   ·   Segment {}",
-                rec.session.subject,
-                rec.session.segments.len()
-            ))
-            .color(MUTED),
-        );
-        ui.add_space(16.0);
-        let mut stop = false;
-        ui.horizontal(|ui| {
-            if ui.add(primary("Stop & save")).clicked() {
-                stop = true;
+        if save {
+            let r = store::write_json(&self.root.path.join("settings.json"), &self.settings);
+            if self.report(r).is_some() {
+                self.settings_saved = self.settings.clone();
+                self.toast("Settings saved");
+                self.settings_open = false;
             }
-            if ui.button("Session settings").clicked() {
-                self.open_settings(1);
-            }
-        });
-        if stop {
-            self.stop(false);
-            return;
+        } else if close || response.should_close() {
+            let appearance = self.settings_saved.appearance;
+            self.settings = self.settings_saved.clone();
+            theme::set_appearance(ctx, appearance);
+            self.settings_open = false;
         }
-        ui.add_space(20.0);
-        self.audio_panel(ui);
-        ui.add_space(24.0);
-        let rec = self.recorder.as_ref().unwrap();
-        ui.horizontal_wrapped(|ui| {
-            eyebrow(ui, "MONITOR");
-            ui.label(
-                RichText::new(format!(
-                    "{} bytes received  ·  {}  ·  {}",
-                    rec.bytes,
-                    if rec.binary_records > 0 {
-                        format!("{} experimental records", rec.binary_records)
-                    } else {
-                        format!("{} decoded messages", rec.messages)
-                    },
-                    rec.status
-                ))
-                .size(11.0)
-                .color(MUTED),
-            );
-        });
-        ui.horizontal_wrapped(|ui| {
-            let source = rec.source();
-            if matches!(source.mode, Source::TcpListen | Source::Udp) {
-                ui.label(
-                    RichText::new(format!("Receiver {}:{}", source.bind, source.port))
-                        .monospace()
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            }
-            if let Some(received) = rec.last_received_elapsed_s {
-                ui.label(
-                    RichText::new(format!(
-                        "Last data {:.1}s ago",
-                        (rec.journal.elapsed() - received).max(0.0)
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
-                );
-            }
-        });
-        ui.add_space(8.0);
-        if rec.binary_records > 0 {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("Live CSV · updated with each record")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                let path = rec.journal.dir.join("waveline_live.csv");
-                if ui
-                    .button("Copy live CSV path")
-                    .on_hover_text(path.display().to_string())
+    }
+    fn settings_content(&mut self, ui: &mut egui::Ui) {
+        let width = ui.available_width();
+        match self.settings_tab {
+            SettingsTab::General => {
+                parts::dialog_heading(ui, "General", "How Pig Pal looks on this laptop.");
+                field_label(ui, "Appearance");
+                let mut appearance = self.settings.appearance;
+                select(ui, "appearance_select", appearance.label(), 240.0, |ui| {
+                    for option in Appearance::ALL {
+                        if menu_item(
+                            ui,
+                            Some(option.icon()),
+                            option.label(),
+                            None,
+                            appearance == option,
+                        )
+                        .clicked()
+                        {
+                            appearance = option;
+                        }
+                    }
+                });
+                if appearance != self.settings.appearance {
+                    self.settings.appearance = appearance;
+                    theme::set_appearance(ui.ctx(), appearance);
+                }
+                ui.label(muted_text("Match system follows macOS. The monitor view stays dark in every mode, like the device.", 12.0));
+                ui.add_space(16.0);
+                field_label(ui, "Data folder");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            mono(self.root.path.display().to_string(), 12.0).color(text_2()),
+                        )
+                        .truncate(),
+                    );
+                });
+                if Btn::secondary("Open in Finder")
+                    .icon(Icon::Folder)
+                    .size(Size::Sm)
+                    .show(ui)
                     .clicked()
                 {
-                    ui.ctx().copy_text(path.display().to_string());
-                }
-            });
-        }
-        if !rec.source().hl7 {
-            ui.add_sized(
-                Vec2::new(230.0, 40.0),
-                egui::Checkbox::new(&mut self.waveline_monitor_view, "Waveline monitor view"),
-            )
-            .on_hover_text(
-                "Compare received values in the monitor layout. Unmapped waveforms stay blank.",
-            );
-        }
-        surface().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            if self.waveline_monitor_view && !rec.source().hl7 {
-                let receipt = rec.last_binary_received_utc
-                    .map(|utc| utc.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true));
-                crate::waveline_monitor::show(
-                    ui,
-                    rec.binary_latest.as_ref(),
-                    rec.last_binary_elapsed_s.map(|at| (rec.journal.elapsed() - at).max(0.0)),
-                    receipt.as_deref(),
-                );
-                return;
-            }
-            if let Some(record) = &rec.binary_latest {
-                binary_panel(ui, record, rec.binary_records, rec.last_binary_elapsed_s.map(|at| (rec.journal.elapsed() - at).max(0.0)));
-                return;
-            }
-            if !rec.source().hl7 {
-                arterial_panel(ui, None, None);
-                ui.add_space(16.0);
-            }
-            if rec.latest.is_empty() {
-                let (title, detail) = if rec.bytes > 0 && rec.last_received_elapsed_s.is_some_and(|at| rec.journal.elapsed() - at > 3.0) {
-                    (
-                        "Monitor stream is inactive",
-                        "Previously received data is saved. No new data has arrived for more than three seconds.",
-                    )
-                } else if rec.bytes > 0 {
-                    if rec.source().hl7 {
-                        (
-                            "Data received · no decoded measurements",
-                            "Raw data is saved. No supported HL7 measurements have been decoded yet.",
-                        )
-                    } else {
-                        (
-                            "Monitor data is being saved",
-                            "Raw stream recording is enabled. Measurements are not decoded for this input.",
-                        )
-                    }
-                } else {
-                    (
-                        "Waiting for monitor data",
-                        "No data has arrived yet. Check the connection settings and monitor output.",
-                    )
-                };
-                ui.label(semibold(title, 16.0));
-                ui.label(
-                    RichText::new(detail).color(MUTED),
-                );
-            } else {
-                let width = ((ui.available_width() - 48.0) / 4.0).max(100.0);
-                ui.horizontal_wrapped(|ui| {
-                    for v in rec.latest.values().take(8) {
-                        ui.vertical(|ui| {
-                            ui.set_width(width);
-                            ui.label(RichText::new(&v.observation.label).size(12.0).color(MUTED));
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&v.observation.value_text)
-                                        .monospace()
-                                        .size(30.0)
-                                        .color(INK),
-                                );
-                                ui.label(
-                                    RichText::new(&v.observation.units).size(11.0).color(MUTED),
-                                );
-                            });
-                            ui.label(
-                                RichText::new(format!(
-                                    "{:.0}s ago",
-                                    (rec.journal.elapsed() - v.elapsed_s).max(0.0)
-                                ))
-                                .size(10.0)
-                                .color(MUTED),
-                            )
-                            .on_hover_text(&v.observation.source);
-                        });
-                    }
-                });
-            }
-        });
-        ui.add_space(10.0);
-        ui.collapsing("Measurement trend", |ui| {
-            self.plot(ui);
-        });
-        ui.add_space(24.0);
-        eyebrow(ui, "TIMELINE");
-        ui.add_space(8.0);
-        ui.horizontal_wrapped(|ui| {
-            for label in ["Baseline", "Intervention", "Sample", "Event"] {
-                if ui.button(format!("+ {label}")).clicked() {
-                    let r = self.recorder.as_mut().unwrap().marker(label, "", None);
+                    let r = open::that(&self.root.path).map_err(Into::into);
                     self.report(r);
                 }
             }
-            if ui
-                .add_enabled(self.note_anchor.is_none(), egui::Button::new("Add note…"))
-                .clicked()
-            {
-                let r = self
-                    .recorder
-                    .as_mut()
-                    .unwrap()
-                    .marker("Note opened", "", None);
-                self.note_anchor = self.report(r);
-                self.note.clear();
+            SettingsTab::Connection => {
+                parts::dialog_heading(
+                    ui,
+                    "Monitor",
+                    "How Pig Pal receives data from the Waveline Pro. Locked while recording.",
+                );
+                ui.add_enabled_ui(self.recorder.is_none(), |ui| {
+                    field_label(ui, "Input");
+                    parts::source_select(
+                        ui,
+                        "settings_source",
+                        &mut self.settings.source.mode,
+                        width,
+                    );
+                    ui.add_space(8.0);
+                    let c = &mut self.settings.source;
+                    if matches!(c.mode, Source::TcpConnect | Source::TcpListen | Source::Udp) {
+                        split_row(
+                            ui,
+                            120.0,
+                            |ui| {
+                                field_label(ui, "Monitor IP / allowed sender");
+                                text_field(ui, "settings_host", &mut c.host, "10.0.0.3", None);
+                            },
+                            |ui| {
+                                field_label(ui, "Port");
+                                let mut port = c.port.to_string();
+                                if text_field(ui, "settings_port", &mut port, "12345", None)
+                                    .changed()
+                                {
+                                    if let Ok(p) = port.trim().parse::<u16>() {
+                                        if p > 0 {
+                                            c.port = p;
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                        if c.mode != Source::TcpConnect {
+                            ui.add_space(8.0);
+                            field_label(ui, "Laptop address to listen on");
+                            text_field(ui, "settings_bind", &mut c.bind, "10.0.0.2", None);
+                            ui.add_space(8.0);
+                            checkbox(
+                                ui,
+                                &mut c.allow_any_peer,
+                                "Accept any sender on this interface",
+                            );
+                        }
+                    }
+                    if c.mode == Source::Serial {
+                        split_row(
+                            ui,
+                            120.0,
+                            |ui| {
+                                field_label(ui, "Serial device");
+                                text_field(
+                                    ui,
+                                    "settings_serial",
+                                    &mut c.serial_port,
+                                    "/dev/ttyUSB0",
+                                    None,
+                                );
+                            },
+                            |ui| {
+                                field_label(ui, "Baud (8N1)");
+                                let mut baud = c.baud.to_string();
+                                if text_field(ui, "settings_baud", &mut baud, "9600", None)
+                                    .changed()
+                                {
+                                    if let Ok(b) = baud.trim().parse::<u32>() {
+                                        c.baud = b.clamp(300, 921_600);
+                                    }
+                                }
+                            },
+                        );
+                    }
+                    if !matches!(c.mode, Source::Demo | Source::Notes) {
+                        ui.add_space(8.0);
+                        checkbox(ui, &mut c.hl7, "Decode generic HL7 v2 / MLLP")
+                            .on_hover_text("Leave off for the Waveline Pro binary stream");
+                        if c.hl7 && c.mode != Source::Udp {
+                            ui.add_space(4.0);
+                            checkbox(
+                                ui,
+                                &mut c.acknowledge,
+                                "Send ORU acknowledgements after saving",
+                            );
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+                parts::note_box(ui, &source_summary(&self.settings.source));
+                ui.add_space(12.0);
+                ui.label(muted_text(
+                    "Tested setup: the monitor at 10.0.0.3 connects by TCP to this laptop at 10.0.0.2:12345 (software A.3.02). Pig Pal never probes or reconfigures the monitor.",
+                    12.0,
+                ));
+            }
+            SettingsTab::Audio => {
+                parts::dialog_heading(ui, "Audio", "Microphone used for recordings and the level meter. Audio always starts paused.");
+                ui.add_enabled_ui(
+                    self.recorder.as_ref().is_none_or(|r| r.mic.is_none()),
+                    |ui| {
+                        field_label(ui, "Microphone");
+                        self.microphone_select(ui, "settings_mic", width);
+                    },
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if Btn::secondary("Refresh devices")
+                        .size(Size::Sm)
+                        .enabled(self.device_scan.is_none())
+                        .show(ui)
+                        .clicked()
+                    {
+                        self.scan_devices();
+                    }
+                    if self.device_scan.is_some() {
+                        ui.add(egui::Spinner::new().size(14.0).color(muted()));
+                        ui.label(muted_text("Looking for inputs…", 12.0));
+                    }
+                });
+                ui.label(muted_text(
+                    "Pause the microphone to switch inputs during a recording.",
+                    12.0,
+                ));
+            }
+            SettingsTab::Transcription => {
+                parts::dialog_heading(ui, "Transcription", model::engine_name());
+                parts::status_line(
+                    ui,
+                    if self.model_ready { live() } else { warn() },
+                    if self.model_ready {
+                        "Model installed. Ready for every session."
+                    } else {
+                        "Model not installed on this laptop."
+                    },
+                );
+                ui.add_space(8.0);
+                if !self.model_ready
+                    && Btn::primary("Download model")
+                        .icon(Icon::Export)
+                        .enabled(self.recorder.is_none() && self.job.is_none())
+                        .show(ui)
+                        .clicked()
+                {
+                    let root = self.root.path.clone();
+                    self.progress = Some("Preparing the transcription model…".into());
+                    self.job(move |tx| {
+                        model::download(&root, |p| {
+                            let _ = tx.send(Update::Progress(p));
+                        })?;
+                        Ok("Transcription model installed".into())
+                    });
+                }
+                ui.label(muted_text("A one-time download shared by all sessions. Transcription runs offline after a recording is saved.", 12.0));
+            }
+            SettingsTab::Media => {
+                parts::dialog_heading(
+                    ui,
+                    "Video & photos",
+                    "Optional extras attached to the active recording.",
+                );
+                field_label(ui, "Video input (FFmpeg)");
+                text_field(
+                    ui,
+                    "settings_video",
+                    &mut self.settings.video_input,
+                    if cfg!(target_os = "macos") {
+                        "0:none"
+                    } else {
+                        "/dev/video0"
+                    },
+                    None,
+                );
+                ui.label(muted_text(
+                    if cfg!(target_os = "macos") {
+                        "AVFoundation device index, e.g. 0:none. Confirm it with FFmpeg."
+                    } else if cfg!(windows) {
+                        "DirectShow device, e.g. video=USB Video."
+                    } else {
+                        "Video4Linux device, e.g. /dev/video0."
+                    },
+                    12.0,
+                ));
+                if let Some(rec) = self.recorder.as_mut() {
+                    let running = rec.video.is_some();
+                    if Btn::secondary(if running { "Stop video" } else { "Start video" })
+                        .size(Size::Sm)
+                        .show(ui)
+                        .clicked()
+                    {
+                        let r = if let Some(mut video) = rec.video.take() {
+                            video
+                                .stop()
+                                .and_then(|info| rec.event("video_closed", info).map(|_| ()))
+                        } else {
+                            let fmt = if cfg!(target_os = "macos") {
+                                "avfoundation"
+                            } else if cfg!(windows) {
+                                "dshow"
+                            } else {
+                                "v4l2"
+                            };
+                            media::Video::start(
+                                &rec.journal.dir,
+                                fmt,
+                                &self.settings.video_input,
+                                rec.journal.elapsed(),
+                            )
+                            .map(|v| rec.video = Some(v))
+                        };
+                        self.report(r);
+                    }
+                }
+                ui.add_space(16.0);
+                field_label(ui, "Attach a photo");
+                text_field(
+                    ui,
+                    "settings_photo",
+                    &mut self.photo_path,
+                    "Absolute path, e.g. /Users/…/photo.jpg",
+                    None,
+                );
+                ui.add_space(4.0);
+                text_field(
+                    ui,
+                    "settings_caption",
+                    &mut self.photo_caption,
+                    "Caption",
+                    None,
+                );
+                ui.add_space(4.0);
+                let attach = Btn::secondary("Attach to recording")
+                    .size(Size::Sm)
+                    .enabled(self.recorder.is_some() && !self.photo_path.trim().is_empty())
+                    .show(ui);
+                if self.recorder.is_none() {
+                    ui.label(muted_text("Available while a recording is running.", 12.0));
+                }
+                if attach.clicked() {
+                    let rec = self.recorder.as_mut().unwrap();
+                    let r = media::attach_photo(
+                        &rec.journal.dir,
+                        &PathBuf::from(&self.photo_path),
+                        &self.photo_caption,
+                    )
+                    .and_then(|info| rec.event("photo", info));
+                    if self.report(r).is_some() {
+                        self.toast("Photo attached");
+                        self.photo_path.clear();
+                        self.photo_caption.clear();
+                    }
+                }
+            }
+        }
+    }
+    /// Microphone picker. Choosing an input saves it immediately.
+    fn microphone_select(&mut self, ui: &mut egui::Ui, id: &str, width: f32) {
+        let current = if self.settings.microphone.is_empty() {
+            "Choose a microphone".to_string()
+        } else {
+            self.settings.microphone.clone()
+        };
+        let mut chosen = None;
+        let response = select(ui, id, &current, width, |ui| {
+            if self.devices.is_empty() {
+                ui.label(muted_text(
+                    if self.device_scan.is_some() {
+                        "Looking for inputs…"
+                    } else {
+                        "No inputs found"
+                    },
+                    12.5,
+                ));
+            }
+            for d in &self.devices {
+                if menu_item(ui, Some(Icon::Mic), d, None, *d == self.settings.microphone).clicked()
+                {
+                    chosen = Some(d.clone());
+                }
             }
         });
-        ui.add_space(12.0);
-        if let Some(rec) = &self.recorder {
-            timeline(ui, &rec.events);
+        if response.clicked() && self.devices.is_empty() {
+            self.scan_devices();
+        }
+        if let Some(device) = chosen {
+            self.persist(|s| s.microphone = device.clone());
         }
     }
-    fn audio_panel(&mut self, ui: &mut egui::Ui) {
-        let rec = self.recorder.as_ref().unwrap();
-        let active = rec.mic.is_some();
-        let now = rec.journal.elapsed();
-        let (status, db) = self.waveform.status(now);
-        let mut toggle = false;
-        egui::Frame::new()
-            .fill(Color32::from_rgb(23, 44, 40))
-            .corner_radius(14)
-            .inner_margin(22)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    status_dot(ui, if active { MINT } else { MUTED });
-                    ui.label(
-                        semibold(
-                            if active {
-                                "Microphone recording"
-                            } else {
-                                "Microphone paused"
-                            },
-                            14.0,
-                        )
-                        .color(Color32::WHITE),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    semibold(
-                                        if active {
-                                            "Pause microphone"
-                                        } else {
-                                            "Start microphone"
-                                        },
-                                        12.0,
-                                    )
-                                    .color(Color32::from_rgb(20, 46, 39)),
-                                )
-                                .fill(MINT)
-                                .stroke(egui::Stroke::NONE),
-                            )
-                            .clicked()
-                        {
-                            toggle = true;
-                        }
-                    });
-                });
-                self.waveform.show(ui, now, active);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(if active {
-                            status
-                        } else if !self.waveform.is_empty() {
-                            "Audio saved · waveform paused"
-                        } else {
-                            "Audio starts only when you enable it"
-                        })
-                        .size(11.0)
-                        .color(if status == "Input clipping" && active {
-                            Color32::from_rgb(255, 178, 131)
-                        } else {
-                            Color32::from_rgb(166, 192, 181)
-                        }),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let detail = if active {
-                            db.map(|d| format!("{d:.0} dBFS  ·  Last 8 seconds"))
-                                .unwrap_or_else(|| "Waiting for microphone samples".into())
-                        } else if self.settings.microphone.is_empty() {
-                            "Select an input in Session settings".into()
-                        } else {
-                            self.settings.microphone.clone()
-                        };
-                        ui.label(
-                            RichText::new(detail)
-                                .size(11.0)
-                                .color(Color32::from_rgb(166, 192, 181)),
-                        );
-                    });
-                });
-            });
-        if toggle {
-            if !active && self.settings.microphone.is_empty() {
-                self.open_settings(1);
-                return;
-            }
-            if !active {
-                self.waveform.clear();
-            }
-            let rec = self.recorder.as_mut().unwrap();
-            let r = if active {
-                rec.stop_mic()
-            } else {
-                rec.start_mic(&self.settings.microphone)
-            };
-            self.report(r);
-        }
-    }
-    fn plot(&mut self, ui: &mut egui::Ui) {
-        let rec = self.recorder.as_ref().unwrap();
-        if rec.latest.is_empty() {
-            return;
-        }
-        if !rec.latest.contains_key(&self.plot_key) {
-            self.plot_key = rec.latest.keys().next().unwrap().clone();
-        }
-        egui::ComboBox::from_id_salt("plot_series")
-            .selected_text(
-                rec.latest
-                    .get(&self.plot_key)
-                    .map(|v| v.observation.label.as_str())
-                    .unwrap_or("Series"),
-            )
-            .show_ui(ui, |ui| {
-                for (key, v) in &rec.latest {
-                    ui.selectable_value(
-                        &mut self.plot_key,
-                        key.clone(),
-                        format!(
-                            "{} · {} · {}",
-                            v.observation.label, v.observation.units, v.observation.source
-                        ),
-                    );
+    fn note_dialog(&mut self, ctx: &egui::Context) {
+        let mut save = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("note"))
+            .frame(modal_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+                parts::dialog_heading(
+                    ui,
+                    "Add note",
+                    &format!(
+                        "Saved at {}, when you opened this note.",
+                        format_time(self.note_opened_at)
+                    ),
+                );
+                let response = ui.add(
+                    egui::TextEdit::multiline(&mut self.note)
+                        .margin(Margin::same(12))
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(RichText::new("What happened?").color(muted())),
+                );
+                if self.note.is_empty() {
+                    response.request_focus();
                 }
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.label(muted_text("⌘ Return to save", 12.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        save |= Btn::primary("Save note").show(ui).clicked();
+                        cancel |= Btn::ghost("Cancel").show(ui).clicked();
+                    });
+                });
+                save |= ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
             });
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 140.0), egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        let end = rec.journal.elapsed().max(60.0);
-        let start = end - 60.0;
-        let points: Vec<_> = rec
-            .history
-            .iter()
-            .filter(|(t, k, _)| *t >= start && *k == self.plot_key)
-            .collect();
-        let min = points
-            .iter()
-            .map(|(_, _, y)| *y)
-            .fold(f64::INFINITY, f64::min);
-        let max = points
-            .iter()
-            .map(|(_, _, y)| *y)
-            .fold(f64::NEG_INFINITY, f64::max);
-        for i in 0..4 {
-            let y = rect.top() + i as f32 * rect.height() / 3.0;
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(1.0, LINE),
-            );
+        if save {
+            if let Some(rec) = self.recorder.as_mut() {
+                let r = rec.marker("Note", &self.note, self.note_anchor.as_deref());
+                if self.report(r).is_some() {
+                    self.note_anchor = None;
+                    self.toast("Note saved");
+                }
+            } else {
+                self.note_anchor = None;
+            }
+        } else if cancel || response.should_close() {
+            self.note_anchor = None;
         }
-        for (t, _, y) in points {
-            let px = rect.left() + ((*t - start) / 60.0) as f32 * rect.width();
-            let py = rect.bottom()
-                - 12.0
-                - ((*y - min) / (max - min).max(1.0)) as f32 * (rect.height() - 24.0);
-            painter.circle_filled(egui::pos2(px, py), 3.0, TEAL);
-        }
-        ui.label(
-            RichText::new("Last 60 seconds · received observations · gaps are preserved")
-                .size(12.0)
-                .color(MUTED),
-        );
     }
-    fn review(&mut self, ui: &mut egui::Ui, id: &str) {
-        let Some(session) = self.sessions.iter().find(|s| s.id == id).cloned() else {
+    fn resume_dialog(&mut self, ctx: &egui::Context) {
+        let Some(session) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id))
+            .cloned()
+        else {
+            self.resume_prompt = false;
             return;
         };
-        ui.add_space(20.0);
-        eyebrow(ui, "LIBRARY  /  SAVED SESSION");
-        ui.add_space(16.0);
-        ui.label(
-            RichText::new(format!(
-                "{}  ·  {} segment(s)",
-                session.subject,
-                session.segments.len()
-            ))
-            .color(MUTED),
-        );
-        ui.label(semibold(&session.title, 30.0));
-        ui.label(
-            RichText::new(format!(
-                "{}{}",
-                session.state,
-                if session.synthetic {
-                    " · Synthetic demo"
-                } else {
-                    ""
-                }
-            ))
-            .size(12.0)
-            .color(TEAL),
-        );
-        ui.add_space(20.0);
-        let dir = self.root.session_dir(id);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(self.job.is_none(), primary("Transcribe saved audio"))
-                .clicked()
-            {
-                let root = self.root.path.clone();
-                let folder = dir.clone();
-                self.notice = "Loading downloaded Redux automatically…".into();
-                self.job(move |tx| {
-                    let n = model::transcribe_session(&root, &folder, |p| {
-                        let _ = tx.send(Update::Progress(p));
-                    })?;
-                    Ok(format!("Saved {n} new transcript(s)."))
+        let mut resume = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::new("resume"))
+            .frame(modal_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(440.0);
+                parts::dialog_heading(
+                    ui,
+                    "Resume recording",
+                    &format!("Recording continues as a new segment of “{}”. Earlier segments are not changed.", session.title),
+                );
+                checkbox(ui, &mut self.authorized, "I am authorized to resume this recording");
+                ui.add_space(20.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    resume = Btn::primary("Resume recording")
+                        .enabled(self.authorized && self.job.is_none())
+                        .show(ui)
+                        .clicked();
+                    cancel = Btn::ghost("Cancel").show(ui).clicked();
                 });
-            }
-            if ui.button("Open session folder").clicked() {
-                let r = open::that(&dir).map_err(Into::into);
-                self.report(r);
-            }
-            if ui.add_enabled(self.job.is_none(), egui::Button::new("Inspect binary capture")).clicked() {
-                let folder = dir.clone();
-                let id = id.to_string();
-                self.notice = "Inspecting saved binary records…".into();
-                self.job(move |tx| {
-                    let inspection = crate::waveline::inspect_session(&folder)?;
-                    let count = inspection.records;
-                    let _ = tx.send(Update::BinaryInspection(id, Box::new(inspection)));
-                    Ok(format!("Inspected {count} experimental binary records. Field mappings remain unverified."))
-                });
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            for (label, include_media) in
-                [("Export data only", false), ("Export with all media", true)]
-            {
-                if ui
-                    .add_enabled(self.job.is_none(), egui::Button::new(label))
-                    .clicked()
-                {
-                    let dir = dir.clone();
-                    let output = self.root.path.join("exports").join(format!(
-                        "{}-{}.zip",
-                        session.id,
-                        store::id()
-                    ));
-                    self.notice = "Preparing export…".into();
-                    self.job(move |_| {
-                        export::archive(&dir, &output, include_media)?;
-                        Ok(format!("Export saved: {}", output.display()))
-                    });
-                }
-            }
-        });
-        if let Some(inspection) = &self.binary_review {
-            ui.add_space(16.0);
-            ui.add_sized(
-                Vec2::new(230.0, 40.0),
-                egui::Checkbox::new(&mut self.waveline_monitor_view, "Waveline monitor view"),
-            );
-            surface().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                if let Some(record) = &inspection.last {
-                    if self.waveline_monitor_view {
-                        crate::waveline_monitor::show(ui, Some(record), None, None);
-                    } else {
-                        binary_panel(ui, record, inspection.records, None);
-                    }
-                } else {
-                    ui.label("No matching Waveline binary records found in this capture.");
-                }
-                ui.label(
-                    RichText::new(format!(
-                        "{} unrecognized bytes · {} trailing bytes retained in originals",
-                        inspection.discarded_bytes, inspection.trailing_bytes
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
-                );
             });
+        if resume {
+            self.start(Some(session));
+        } else if cancel || response.should_close() {
+            self.resume_prompt = false;
         }
-        if !model::installed(&self.root.path) {
-            ui.horizontal(|ui| {
-                ui.label("Download Redux once to enable offline transcription.");
-                if ui.button("Model settings").clicked() {
-                    self.settings_open = true;
-                }
-            });
-        }
-        ui.add_space(24.0);
-        surface().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(semibold("Transcript", 18.0));
-                ui.label(
-                    RichText::new(format!("{} clips", self.transcripts.len()))
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            });
-            ui.add_space(12.0);
-            if self.transcripts.is_empty() {
-                ui.label(RichText::new("No transcript yet").color(MUTED));
-                ui.label(
-                    RichText::new(
-                        "Use Transcribe saved audio to turn this session’s recordings into text.",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-            }
-            for t in &self.transcripts {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{}  ·  {}",
-                        t.audio_started
-                            .with_timezone(&chrono::Local)
-                            .format("%H:%M:%S"),
-                        t.engine
-                    ))
-                    .size(11.0)
-                    .color(MUTED),
-                );
-                ui.add_space(6.0);
+    }
+    fn error_dialog(&mut self, ctx: &egui::Context, error: String) {
+        let mut dismiss = false;
+        let response = egui::Modal::new(egui::Id::new("error"))
+            .frame(modal_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                parts::dialog_heading(ui, "Something needs attention", "");
                 ui.add(
-                    egui::Label::new(RichText::new(&t.text).size(17.0))
+                    egui::Label::new(secondary(error, 13.5))
                         .wrap()
                         .selectable(true),
                 );
-                if !t.timings_valid {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(
-                            "Some word timestamps exceed this clip. Original results are retained.",
-                        )
-                        .size(11.0)
-                        .color(MUTED),
-                    );
-                }
-                ui.add_space(12.0);
-            }
-        });
-        ui.add_space(26.0);
-        eyebrow(ui, "SESSION TIMELINE");
-        ui.add_space(12.0);
-        timeline(ui, &self.review);
-        ui.add_space(14.0);
-        ui.collapsing("Saved monitor observations", |ui| {
-            ui.label(
-                RichText::new("Latest 50 messages in this view; exports contain the full journal.")
-                    .small()
-                    .color(MUTED),
-            );
-            for e in self
-                .review
-                .iter()
-                .rev()
-                .filter(|e| e.kind == "message")
-                .take(50)
-            {
-                if let Ok(message) =
-                    serde_json::from_value::<crate::protocol::Message>(e.data["message"].clone())
-                {
-                    ui.label(
-                        RichText::new(
-                            e.utc
-                                .with_timezone(&chrono::Local)
-                                .format("%H:%M:%S")
-                                .to_string(),
-                        )
-                        .monospace()
-                        .color(MUTED),
-                    );
-                    for o in message.observations {
-                        ui.label(format!(
-                            "{}  {} {}  ·  {}",
-                            o.label, o.value_text, o.units, o.source
-                        ));
-                    }
-                }
-            }
-        });
-        let mut files: Vec<_> = walkdir::WalkDir::new(dir.join("segments"))
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file()
-                    && matches!(
-                        e.path().extension().and_then(|x| x.to_str()),
-                        Some("wav" | "mkv" | "jpg" | "png" | "jpeg")
-                    )
-            })
-            .map(|e| e.path().to_path_buf())
-            .collect();
-        files.sort();
-        ui.add_space(20.0);
-        eyebrow(ui, "SAVED MEDIA");
-        for (index, file) in files.into_iter().enumerate() {
-            if ui
-                .button(format!(
-                    "Open {} {:02}",
-                    if file.extension().and_then(|s| s.to_str()) == Some("wav") {
-                        "audio clip"
+                ui.add_space(20.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    dismiss = Btn::primary("OK").width(72.0).show(ui).clicked();
+                });
+            });
+        if dismiss || response.should_close() {
+            self.error = None;
+        }
+    }
+    fn close_dialog(&mut self, ctx: &egui::Context) {
+        let mut keep = false;
+        let mut stop = false;
+        let response = egui::Modal::new(egui::Id::new("close"))
+            .frame(modal_frame())
+            .backdrop_color(Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                parts::dialog_heading(
+                    ui,
+                    "Quit Pig Pal?",
+                    if self.job.is_some() {
+                        "A transcription or export is still running. Wait for it to finish."
                     } else {
-                        "media file"
+                        "The recording will be stopped and saved before Pig Pal quits."
                     },
-                    index + 1
-                ))
-                .clicked()
-            {
-                let r = open::that(file).map_err(Into::into);
-                self.report(r);
+                );
+                ui.add_space(4.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.job.is_none() {
+                        stop = Btn::danger("Stop, save & quit").show(ui).clicked();
+                    }
+                    keep = Btn::ghost("Keep recording").show(ui).clicked();
+                });
+            });
+        if stop {
+            self.stop(false);
+            if self.error.is_none() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        ui.add_space(24.0);
-        ui.separator();
-        ui.add_space(12.0);
-        ui.collapsing("Continue this session", |ui| {
-            ui.checkbox(
-                &mut self.authorized,
-                "Authorized to resume into a new segment",
-            );
-            if ui
-                .add_enabled(
-                    self.authorized && self.job.is_none(),
-                    egui::Button::new("Resume session"),
-                )
-                .clicked()
-            {
-                self.start(Some(session));
-            }
-        });
+        if keep || response.should_close() {
+            self.close_confirm = false;
+        }
     }
-    fn settings(&mut self, ctx: &egui::Context) {
-        let mut opened = self.settings_open;
-        let mut saved = false;
-        egui::Window::new("Settings").open(&mut opened).default_width(610.0).resizable(true).vscroll(true).show(ctx,|ui| {
-            ui.horizontal(|ui| {
-                for (index,label) in ["Connection","Audio","Transcription","Media"].iter().enumerate() {
-                    ui.selectable_value(&mut self.settings_tab,index,*label);
+    fn toasts(&mut self, ctx: &egui::Context, offset_x: f32) {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        let mut items: Vec<(Option<String>, String, Color32)> = self
+            .toasts
+            .iter()
+            .map(|t| {
+                (
+                    None,
+                    t.text.clone(),
+                    if t.kind == ToastKind::Warn {
+                        warn()
+                    } else {
+                        live()
+                    },
+                )
+            })
+            .collect();
+        if self.job.is_some() {
+            let text = self.progress.clone().unwrap_or_else(|| "Working…".into());
+            items.push((Some(String::new()), text, accent()));
+        }
+        if items.is_empty() {
+            return;
+        }
+        if let Some(next) = self.toasts.iter().map(|t| t.until).min() {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
+        }
+        egui::Area::new(egui::Id::new("toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(offset_x, -20.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 8.0;
+                for (spinner, text_, color) in items {
+                    egui::Frame::new()
+                        .fill(surface())
+                        .stroke(Stroke::new(1.0, line_strong()))
+                        .corner_radius(10)
+                        .inner_margin(Margin::symmetric(14, 10))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 6],
+                            blur: 20,
+                            spread: 0,
+                            color: Color32::from_black_alpha(palette().shadow),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_max_width(520.0);
+                            ui.horizontal(|ui| {
+                                if spinner.is_some() {
+                                    ui.add(egui::Spinner::new().size(14.0).color(color));
+                                } else {
+                                    dot(ui, color, 3.5);
+                                }
+                                ui.add(
+                                    egui::Label::new(RichText::new(text_).size(13.0).color(text()))
+                                        .truncate(),
+                                );
+                            });
+                        });
                 }
             });
-            ui.add_space(16.0);ui.separator();ui.add_space(16.0);
-            match self.settings_tab {
-                0=>{
-                    ui.label(semibold("Monitor connection",20.0));
-                    ui.add_space(8.0);
-                    ui.add_enabled_ui(self.recorder.is_none(),|ui| {
-                        source_combo(ui,&mut self.settings.source.mode);
-                        let c=&mut self.settings.source;
-                        if matches!(c.mode,Source::TcpConnect|Source::TcpListen|Source::Udp){
-                            ui.label("Monitor IP / allowed sender");ui.text_edit_singleline(&mut c.host);
-                            if c.mode!=Source::TcpConnect {ui.label("Laptop bind address");ui.text_edit_singleline(&mut c.bind);ui.checkbox(&mut c.allow_any_peer,"Accept any sender on this interface");}
-                            ui.horizontal(|ui|{ui.label("Port");ui.add(egui::DragValue::new(&mut c.port).range(1..=65535));});
-                        }
-                        if c.mode==Source::Serial {ui.label("Serial device (COM3 or /dev/ttyUSB0)");ui.text_edit_singleline(&mut c.serial_port);ui.horizontal(|ui|{ui.label("Baud · 8N1");ui.add(egui::DragValue::new(&mut c.baud).range(300..=921600));});}
-                        if !matches!(c.mode,Source::Demo|Source::Notes){ui.checkbox(&mut c.hl7,"Decode generic HL7 v2 / MLLP");if c.hl7&&c.mode!=Source::Udp{ui.checkbox(&mut c.acknowledge,"Send original-mode ORU ACK after durable storage");}}
-                    });
-                    ui.add_space(16.0);
-                    ui.collapsing("Waveline Pro reference",|ui|{ui.label("Software A.3.02 · Kernel K1-LPC3250-V1.0");ui.label("Module M1-ERTIC-V1.0 · Type 5A · Version V2.0.0");ui.label("Live export and protocol on this unit remain unverified. No automatic probing or monitor configuration is performed.");});
-                },
-                1=>{
-                    ui.label(semibold("Microphone input",20.0));
-                    ui.label(RichText::new("Choose the input used for recordings and the live waveform.").color(MUTED));
-                    ui.add_space(16.0);
-                    ui.add_enabled_ui(self.recorder.as_ref().is_none_or(|r|r.mic.is_none()),|ui| {
-                        egui::ComboBox::from_id_salt("microphone").width(340.0).selected_text(if self.settings.microphone.is_empty(){"Choose a microphone"}else{&self.settings.microphone}).show_ui(ui,|ui| {
-                            for d in &self.devices {ui.selectable_value(&mut self.settings.microphone,d.clone(),d);}
-                        });
-                    });
-                    if ui.add_enabled(self.device_scan.is_none(),egui::Button::new("Refresh input devices")).clicked(){self.scan_devices();}
-                    if self.device_scan.is_some() {ui.horizontal(|ui| {ui.spinner();ui.label("Finding audio inputs…");});}
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("Audio starts paused in each segment. Pause the microphone to change inputs.").size(12.0).color(MUTED));
-                },
-                2=>{
-                    ui.label(semibold("Offline transcription",20.0));
-                    ui.label(RichText::new(model::engine_name()).color(MUTED));
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {status_dot(ui,TEAL);ui.label(if model::installed(&self.root.path){"Downloaded · ready for every session"}else{"Model not downloaded on this laptop"});});
-                    if ui.add_enabled(self.recorder.is_none()&&self.job.is_none()&&!model::installed(&self.root.path),primary("Download Redux once")).clicked(){let root=self.root.path.clone();self.notice="Preparing Redux…".into();self.job(move|tx|{model::download(&root,|p|{let _=tx.send(Update::Progress(p));})?;Ok("Redux ready for every session. It loads automatically when you transcribe.".into())});}
-                    ui.add_space(12.0);
-                    ui.label(RichText::new("One download per laptop, shared by all sessions. Transcribe saved audio after stopping capture.").color(MUTED));
-                },
-                _=>{
-                    ui.label(semibold("Video & photos",20.0));
-                    ui.label("Optional video input through FFmpeg");ui.text_edit_singleline(&mut self.settings.video_input);
-                    ui.label(RichText::new(if cfg!(target_os="macos"){"AVFoundation input, e.g. 0:none. Confirm the device index with FFmpeg."}else if cfg!(windows){"DirectShow input, e.g. video=USB Video. Use the exact device name."}else{"Video4Linux input, e.g. /dev/video0."}).small().color(MUTED));
-                    if let Some(rec)=self.recorder.as_mut(){
-                        if ui.button(if rec.video.is_some(){"Stop video"}else{"Start video"}).clicked(){
-                            let r=if let Some(mut video)=rec.video.take(){video.stop().and_then(|info|rec.event("video_closed",info).map(|_|()))}else{
-                                let fmt=if cfg!(target_os="macos"){"avfoundation"}else if cfg!(windows){"dshow"}else{"v4l2"};
-                                media::Video::start(&rec.journal.dir,fmt,&self.settings.video_input,rec.journal.elapsed()).map(|v|rec.video=Some(v))
-                            };self.report(r);
-                        }
-                    }
-                    ui.add_space(20.0);ui.separator();ui.add_space(12.0);
-                    ui.label("Attach an existing photo (absolute file path)");ui.text_edit_singleline(&mut self.photo_path);ui.add(egui::TextEdit::singleline(&mut self.photo_caption).hint_text("Photo caption"));
-                    if ui.add_enabled(self.recorder.is_some(),egui::Button::new("Attach photo to active session")).clicked(){let rec=self.recorder.as_mut().unwrap();let r=media::attach_photo(&rec.journal.dir,&PathBuf::from(&self.photo_path),&self.photo_caption).and_then(|info|rec.event("photo",info));self.report(r);}
-                }
-            }
-            ui.add_space(24.0);ui.separator();ui.add_space(12.0);
-            if ui.add(primary("Save settings")).clicked(){let r=store::write_json(&self.root.path.join("settings.json"),&self.settings);if self.report(r).is_some(){self.notice="Settings saved.".into();saved=true;}}
-        });
-        self.settings_open = opened && !saved;
     }
-}
-impl eframe::App for Desktop {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+    fn frame(&mut self, ctx: &egui::Context) {
         self.tick();
-        ctx.request_repaint_after(Duration::from_millis(
-            if self.recorder.as_ref().is_some_and(|r| r.mic.is_some()) {
-                33
-            } else {
-                150
-            },
-        ));
-        if ctx.input(|i| i.viewport().close_requested())
-            && (self.recorder.is_some() || self.job.is_some())
-        {
+        // Capture runs on its own thread, so these rates only affect what is shown.
+        // An unfocused window refreshes once a second; a hidden or minimized one
+        // is not drawn at all.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        let mic = self.recorder.as_ref().is_some_and(|r| r.mic.is_some());
+        let playing = self.replay.as_ref().is_some_and(|r| r.player.playing);
+        if !focused && (self.recorder.is_some() || playing) {
+            ctx.request_repaint_after(Duration::from_millis(1000));
+        } else if mic || playing {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else if self.recorder.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        } else if self.job.is_some() || self.device_scan.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.busy() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirm = true;
         }
-        self.sidebar(ctx);
-        egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::new()
-                    .fill(PAPER)
-                    .inner_margin(egui::Margin::symmetric(28, 10)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if self.job.is_some() {
-                        ui.spinner();
-                    }
-                    ui.add(
-                        egui::Label::new(RichText::new(&self.notice).small().color(MUTED))
-                            .truncate(),
-                    )
-                    .on_hover_text(&self.notice);
-                    if let Ok(bytes) = fs2::available_space(&self.root.path) {
-                        ui.label(
-                            RichText::new(format!("{:.1} GB free", bytes as f64 / 1e9))
-                                .small()
-                                .color(MUTED),
-                        );
-                    }
-                });
-            });
+        ctx.layer_painter(egui::LayerId::background())
+            .rect_filled(ctx.screen_rect(), 0, bg());
+        let replay_mode = self.replay.is_some() && self.recorder.is_none();
+        let show_sidebar = !replay_mode || self.replay.as_ref().is_some_and(|r| r.show_library);
+        if show_sidebar {
+            self.sidebar(ctx);
+        }
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(PAPER)
-                    .inner_margin(egui::Margin::symmetric(32, 24)),
-            )
+            .frame(egui::Frame::new().fill(bg()).inner_margin(if replay_mode {
+                Margin::symmetric(20, 16)
+            } else {
+                Margin {
+                    left: 36,
+                    right: 36,
+                    top: 28,
+                    bottom: 0,
+                }
+            }))
             .show(ctx, |ui| {
+                if replay_mode {
+                    if let Some(id) = self.selected.clone() {
+                        self.replay_screen(ui, &id);
+                    }
+                    return;
+                }
                 egui::ScrollArea::vertical()
                     .id_salt(("workspace", self.selected.clone(), self.recorder.is_some()))
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.add_space(4.0);
                         if self.recorder.is_some() {
                             self.live(ui);
                         } else if let Some(id) = self.selected.clone() {
@@ -1263,385 +1409,210 @@ impl eframe::App for Desktop {
                         } else {
                             self.new_session(ui);
                         }
+                        ui.add_space(40.0);
                     });
             });
+        self.toasts(
+            ctx,
+            if show_sidebar {
+                SIDEBAR_WIDTH / 2.0
+            } else {
+                0.0
+            },
+        );
         if self.settings_open {
             self.settings(ctx);
         }
         if self.note_anchor.is_some() {
-            egui::Window::new("Add note")
-                .collapsible(false)
-                .default_width(480.0)
-                .show(ctx, |ui| {
-                    ui.label("The event was timestamped when you opened this note.");
-                    let response = ui.add(
-                        egui::TextEdit::multiline(&mut self.note)
-                            .desired_rows(6)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if self.note.is_empty() {
-                        response.request_focus();
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.add(primary("Save note")).clicked() {
-                            if let Some(rec) = self.recorder.as_mut() {
-                                let r = rec.marker("Note", &self.note, self.note_anchor.as_deref());
-                                if self.report(r).is_some() {
-                                    self.note_anchor = None;
-                                }
-                            }
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.note_anchor = None;
-                        }
-                    });
-                });
+            self.note_dialog(ctx);
+        }
+        if self.resume_prompt && self.recorder.is_none() {
+            self.resume_dialog(ctx);
         }
         if let Some(error) = self.error.clone() {
-            egui::Window::new("Action needs attention")
-                .collapsible(false)
-                .default_width(520.0)
-                .show(ctx, |ui| {
-                    ui.label(error);
-                    if ui.button("Dismiss").clicked() {
-                        self.error = None;
-                    }
-                });
+            self.error_dialog(ctx, error);
         }
         if self.close_confirm {
-            egui::Window::new("Close Pig Pal?")
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    if self.job.is_some() {
-                        ui.label("Wait for the current transcription or export to finish.");
-                    } else if ui.button("Stop, save & close").clicked() {
-                        self.stop(false);
-                        if self.error.is_none() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
-                    if ui.button("Keep open").clicked() {
-                        self.close_confirm = false;
-                    }
-                });
+            self.close_dialog(ctx);
         }
     }
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+}
+
+impl eframe::App for Desktop {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        theme::sync(ctx);
+        self.reclaim();
+        self.frame(ctx);
+        self.park();
+    }
+    fn on_exit(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            if let Some(rec) = capture.shutdown() {
+                self.recorder = Some(rec);
+            }
+        }
         if let Some(mut rec) = self.recorder.take() {
             let _ = rec.stop(&self.root, true);
         }
     }
 }
+
 pub(crate) fn configure_style(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "Inter".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")).into(),
-    );
-    fonts.font_data.insert(
-        "Inter Semibold".into(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")).into(),
-    );
-    fonts
-        .families
-        .get_mut(&egui::FontFamily::Proportional)
-        .unwrap()
-        .insert(0, "Inter".into());
-    fonts.families.insert(
-        egui::FontFamily::Name("Semibold".into()),
-        vec!["Inter Semibold".into()],
-    );
-    ctx.set_fonts(fonts);
-    let mut v = egui::Visuals::light();
-    v.panel_fill = PAPER;
-    v.window_fill = Color32::WHITE;
-    v.extreme_bg_color = Color32::WHITE;
-    v.override_text_color = Some(INK);
-    v.faint_bg_color = SOFT;
-    v.selection.bg_fill = SOFT;
-    v.selection.stroke = egui::Stroke::new(1.0, TEAL);
-    v.window_corner_radius = 14.into();
-    v.window_stroke = egui::Stroke::new(1.0, LINE);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, LINE);
-    for w in [
-        &mut v.widgets.inactive,
-        &mut v.widgets.hovered,
-        &mut v.widgets.active,
-        &mut v.widgets.open,
-    ] {
-        w.corner_radius = 8.into();
-        w.bg_stroke = egui::Stroke::new(1.0, LINE);
-        w.fg_stroke = egui::Stroke::new(1.0, INK);
-        w.expansion = 0.0;
-    }
-    v.widgets.inactive.weak_bg_fill = Color32::WHITE;
-    v.widgets.inactive.bg_fill = Color32::WHITE;
-    v.widgets.hovered.weak_bg_fill = SOFT;
-    v.widgets.hovered.bg_fill = SOFT;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, TEAL);
-    v.widgets.active.weak_bg_fill = Color32::from_rgb(218, 233, 224);
-    v.widgets.active.bg_fill = SOFT;
-    ctx.set_visuals(v);
-    let mut s = (*ctx.style()).clone();
-    s.spacing.item_spacing = Vec2::new(12.0, 8.0);
-    s.spacing.button_padding = Vec2::new(16.0, 12.0);
-    s.spacing.interact_size.y = 24.0;
-    s.spacing.combo_height = 280.0;
-    s.spacing.window_margin = 24.into();
-    s.animation_time = 0.12;
-    s.text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-    s.text_styles
-        .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
-    s.text_styles
-        .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
-    s.text_styles.insert(
-        egui::TextStyle::Heading,
-        egui::FontId::new(26.0, egui::FontFamily::Name("Semibold".into())),
-    );
-    ctx.set_style(s);
-}
-fn semibold(text: impl Into<String>, size: f32) -> RichText {
-    RichText::new(text).font(egui::FontId::new(
-        size,
-        egui::FontFamily::Name("Semibold".into()),
-    ))
-}
-fn eyebrow(ui: &mut egui::Ui, text: &str) {
-    ui.label(semibold(text, 10.0).color(MUTED));
-}
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let (r, _) = ui.allocate_exact_size(Vec2::new(8.0, 12.0), egui::Sense::hover());
-    ui.painter().circle_filled(r.center(), 3.0, color);
-}
-fn badge(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .fill(SOFT)
-        .corner_radius(5)
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.label(semibold(text, 9.0).color(TEAL));
-        });
-}
-fn surface() -> egui::Frame {
-    egui::Frame::new()
-        .fill(Color32::WHITE)
-        .stroke(egui::Stroke::new(1.0, LINE))
-        .corner_radius(12)
-        .inner_margin(24)
-}
-fn primary(text: &str) -> egui::Button<'_> {
-    egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
-        .fill(TEAL)
-        .stroke(egui::Stroke::NONE)
-        .min_size(Vec2::new(0.0, 40.0))
-}
-fn source_combo(ui: &mut egui::Ui, source: &mut Source) {
-    egui::ComboBox::from_id_salt(ui.id().with("source"))
-        .selected_text(source.label())
-        .show_ui(ui, |ui| {
-            for item in Source::ALL {
-                ui.selectable_value(source, item, item.label());
-            }
-        });
-}
-fn format_time(seconds: f64) -> String {
-    let s = seconds as u64;
-    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
-}
-pub(crate) fn arterial_panel(
-    ui: &mut egui::Ui,
-    record: Option<&crate::waveline::Record>,
-    age: Option<f64>,
-) {
-    let stale = age.is_some_and(|age| age > crate::waveline::STALE_AFTER_S);
-    let sample = record.and_then(|r| r.arterial_pressure.as_ref());
-    let values = crate::waveline::ArterialPressure::cells(if stale { None } else { sample });
-    let has_values = !stale && values.iter().take(3).any(|v| !v.is_empty());
-    let status = if stale {
-        "Not reading · stream stale"
-    } else if has_values {
-        if age.is_some() {
-            "Receiving · candidate values"
-        } else {
-            "Saved arterial sample"
-        }
-    } else {
-        "Not reading yet"
-    };
-    egui::Frame::new().fill(SOFT).corner_radius(10).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(semibold("Arterial line pressure (ART/P1)", 16.0));
-            ui.label(RichText::new(status).size(12.0).strong().color(
-                if has_values { TEAL } else { Color32::from_rgb(139, 91, 35) }
-            ));
-        });
-        ui.add_space(12.0);
-        ui.columns(3, |columns| {
-            for (index, label) in ["Arterial systolic", "Arterial diastolic", "Arterial mean (MAP)"].iter().enumerate() {
-                columns[index].label(RichText::new(*label).size(12.0).color(MUTED));
-                columns[index].label(RichText::new(if values[index].is_empty() { "—" } else { &values[index] })
-                    .monospace().size(25.0).color(if has_values { INK } else { MUTED }));
-            }
-        });
-        ui.add_space(8.0);
-        let detail = if sample.is_none() {
-            "No decoded P1 sample available yet. Waiting for a new monitor record; older captures may have no P1 decoding."
-        } else if stale {
-            "No new complete monitor record for more than 3 seconds. Arterial values are hidden until new decoded samples arrive."
-        } else if !has_values {
-            "The latest decoded arterial sample has no available values. This section stays visible while waiting."
-        } else {
-            "P1 candidates · i32 LE bytes 36 / 40 / 44. Connected display reference supports these fields. Units and channel-validity flags remain unverified; fresh records can contain unavailable or retained device values."
-        };
-        ui.label(RichText::new(detail).size(11.0).color(MUTED));
-    });
+    theme::configure(ctx);
 }
 
-fn binary_panel(ui: &mut egui::Ui, record: &crate::waveline::Record, count: u64, age: Option<f64>) {
-    ui.label(semibold("Experimental binary decoder", 18.0));
-    ui.label(RichText::new("Candidate field meanings and units are unverified. These values are excluded from measurement trends and note context.").size(12.0).color(MUTED));
-    ui.label(
-        RichText::new(format!(
-            "{count} complete records · latest record offset {}",
-            record.stream_offset
-        ))
-        .size(11.0)
-        .color(MUTED),
-    );
-    let freshness = age
-        .map(|age| {
-            if age > 3.0 {
-                format!("STALE SNAPSHOT · last complete record {age:.1}s ago")
-            } else {
-                format!("Last complete record {age:.1}s ago")
-            }
-        })
-        .unwrap_or_else(|| "Saved capture snapshot · not live data".into());
-    ui.label(
-        RichText::new(freshness)
-            .size(12.0)
-            .color(if age.is_some_and(|age| age > 3.0) {
-                Color32::from_rgb(156, 90, 34)
-            } else {
-                MUTED
-            }),
-    );
-    ui.add_space(12.0);
-    arterial_panel(ui, Some(record), age);
-    ui.add_space(16.0);
-    let width = ((ui.available_width() - 32.0) / 3.0).max(100.0);
-    egui::Grid::new("binary_candidates")
-        .num_columns(3)
-        .spacing([16.0, 12.0])
-        .show(ui, |ui| {
-            for (i, field) in record.fields.iter().enumerate() {
-                ui.vertical(|ui| {
-                    ui.set_width(width);
-                    ui.label(RichText::new(field.hypothesis).size(12.0).color(MUTED));
-                    let value = field
-                        .value
-                        .map(|v| {
-                            if field.encoding == "u16 LE" {
-                                format!("{v:.0}")
-                            } else {
-                                format!("{v:.3}")
-                            }
-                        })
-                        .unwrap_or_else(|| "Non-finite".into());
-                    ui.label(RichText::new(value).monospace().size(23.0).color(INK))
-                        .on_hover_text(format!("Original bytes: {}", field.raw_hex));
-                    ui.label(
-                        RichText::new(format!(
-                            "{} · byte {} · raw value",
-                            field.encoding, field.offset
-                        ))
-                        .monospace()
-                        .size(10.0)
-                        .color(MUTED),
-                    );
-                });
-                if i % 3 == 2 {
-                    ui.end_row();
-                }
-            }
-        });
-    ui.add_space(12.0);
-    egui::CollapsingHeader::new("Raw signal slices · uncalibrated").default_open(true).show(ui,|ui| {
-        ui.label(RichText::new("Latest record only · unsigned bytes 0–255 · sample rate and channel identities unverified").size(11.0).color(MUTED));
-        for signal in &record.signal_slices {
-            ui.label(RichText::new(format!("Byte {} · {} samples",signal.offset,signal.samples.len())).monospace().size(11.0).color(MUTED));
-            let (rect,_) = ui.allocate_exact_size(egui::vec2(ui.available_width(),56.0),egui::Sense::hover());
-            let painter = ui.painter_at(rect);
-            painter.line_segment([egui::pos2(rect.left(),rect.center().y),egui::pos2(rect.right(),rect.center().y)],egui::Stroke::new(1.0,LINE));
-            let points = signal.samples.iter().enumerate().map(|(i,&v)| egui::pos2(rect.left()+i as f32/(signal.samples.len()-1).max(1) as f32*rect.width(),rect.bottom()-f32::from(v)/255.0*rect.height())).collect();
-            painter.add(egui::Shape::line(points,egui::Stroke::new(1.5,TEAL)));
-        }
-    });
+// ---------------------------------------------------------------------------
+// Helpers
+
+fn state_style(state: &str) -> (&'static str, Color32) {
+    match state {
+        "completed" => ("Completed", text_2()),
+        "recording" => ("Recording", danger()),
+        "interrupted" => ("Interrupted", warn()),
+        _ => ("Saved", text_2()),
+    }
 }
-fn timeline(ui: &mut egui::Ui, events: &VecDeque<Event>) {
-    let mut any = false;
-    for e in events
+
+fn session_duration(s: &Session) -> Option<f64> {
+    let total: f64 = s
+        .segments
         .iter()
-        .rev()
-        .filter(|e| {
-            matches!(
-                e.kind.as_str(),
-                "marker"
-                    | "annotation"
-                    | "audio_closed"
-                    | "photo"
-                    | "start"
-                    | "stop"
-                    | "video_closed"
-                    | "audio_error"
-            )
+        .filter_map(|seg| {
+            seg.ended
+                .map(|end| (end - seg.started).num_milliseconds() as f64 / 1000.0)
         })
-        .take(100)
-    {
-        any = true;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new(
-                    e.utc
-                        .with_timezone(&chrono::Local)
-                        .format("%H:%M:%S")
-                        .to_string(),
-                )
-                .monospace()
-                .size(11.0)
-                .color(MUTED),
-            );
-            let friendly = match e.kind.as_str() {
-                "audio_closed" => "Audio saved",
-                "start" => "Session started",
-                "stop" => "Session saved",
-                "video_closed" => "Video saved",
-                "audio_error" => "Audio interrupted",
-                "photo" => "Photo attached",
-                other => other,
-            };
-            let label = e.data["label"].as_str().unwrap_or(friendly);
-            ui.label(semibold(label, 12.0));
-            if let Some(note) = e.data["note"].as_str() {
-                ui.label(note);
+        .sum();
+    (total > 0.0).then_some(total)
+}
+
+fn source_summary(c: &SourceConfig) -> String {
+    let decode = if c.hl7 {
+        "HL7 v2 decoding"
+    } else {
+        "Waveline binary decoding (experimental)"
+    };
+    match c.mode {
+        Source::Demo => "Generated measurements · no monitor connection".into(),
+        Source::Notes => "No monitor · notes, audio and media only".into(),
+        Source::TcpListen => format!(
+            "Listens on {}:{} for {} · {decode}",
+            c.bind,
+            c.port,
+            if c.allow_any_peer {
+                "any sender"
+            } else {
+                c.host.as_str()
             }
-            if e.kind == "audio_closed" {
-                ui.label(format!(
-                    "{:.1}s · {}",
-                    e.data["duration_s"].as_f64().unwrap_or(0.0),
-                    e.data["device"].as_str().unwrap_or("")
-                ));
-            }
-            if let Some(detail) = e.data["detail"].as_str() {
-                ui.label(detail);
-            }
-        });
-    }
-    if !any {
-        ui.label(RichText::new("Markers and notes will appear here.").color(MUTED));
+        ),
+        Source::Udp => format!("UDP on {}:{} · {decode}", c.bind, c.port),
+        Source::TcpConnect => format!("Connects to {}:{} · {decode}", c.host, c.port),
+        Source::Serial => format!(
+            "{} at {} baud · {decode}",
+            if c.serial_port.is_empty() {
+                "No serial device"
+            } else {
+                &c.serial_port
+            },
+            c.baud
+        ),
     }
 }
+
+fn format_time(seconds: f64) -> String {
+    let s = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
+}
+fn format_duration(seconds: f64) -> String {
+    let s = seconds.round() as u64;
+    match (s / 3600, (s / 60) % 60, s % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+fn format_bytes(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= 1e9 {
+        format!("{:.1} GB", b / 1e9)
+    } else if b >= 1e6 {
+        format!("{:.1} MB", b / 1e6)
+    } else if b >= 1e3 {
+        format!("{:.0} KB", b / 1e3)
+    } else {
+        format!("{bytes} B")
+    }
+}
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Timeline rows with each note placed at the moment its "Note opened" marker
+/// was captured; that placeholder marker itself is dropped.
+fn timeline_rows(events: &[Event]) -> Vec<(chrono::DateTime<chrono::Utc>, &Event)> {
+    let anchors: HashMap<&str, &Event> = events
+        .iter()
+        .filter(|e| e.kind == "marker")
+        .map(|e| (e.id.as_str(), e))
+        .collect();
+    let amended: HashSet<&str> = events
+        .iter()
+        .filter(|e| e.kind == "annotation")
+        .filter_map(|e| e.data["amends_id"].as_str())
+        .collect();
+    let mut rows: Vec<(chrono::DateTime<chrono::Utc>, &Event)> = events
+        .iter()
+        .filter(|e| store::TIMELINE_KINDS.contains(&e.kind.as_str()))
+        .filter(|e| !(e.kind == "marker" && amended.contains(e.id.as_str())))
+        .map(|e| {
+            let at = e.data["amends_id"]
+                .as_str()
+                .and_then(|id| anchors.get(id))
+                .map_or(e.utc, |anchor| anchor.utc);
+            (at, e)
+        })
+        .collect();
+    rows.sort_by_key(|(at, e)| (*at, e.sequence));
+    rows
+}
+
+/// Markers and notes for the replay viewer, oldest first.
+fn replay_notes(events: &[Event]) -> Vec<crate::replay_ui::ReplayNote> {
+    timeline_rows(events)
+        .into_iter()
+        .filter(|(_, e)| matches!(e.kind.as_str(), "marker" | "annotation"))
+        .map(|(at, e)| {
+            let text = e.data["note"].as_str().unwrap_or("").trim().to_string();
+            crate::replay_ui::ReplayNote {
+                at,
+                label: e.data["label"]
+                    .as_str()
+                    .filter(|l| !l.is_empty())
+                    .unwrap_or("Note")
+                    .to_string(),
+                is_note: e.kind == "annotation" || !text.is_empty(),
+                text,
+            }
+        })
+        .collect()
+}
+
+#[path = "ui_parts.rs"]
+mod parts;
+#[path = "ui_views.rs"]
+mod views;
+#[cfg(test)]
+pub(crate) use parts::arterial_panel;
 
 #[cfg(test)]
 mod arterial_ui_tests {
@@ -1703,4 +1674,160 @@ mod arterial_ui_tests {
         assert!(unavailable.contains("Not reading yet"));
         assert_eq!(unavailable.matches('—').count(), 3);
     }
+
+    #[test]
+    fn helpers_format_human_readable_values() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(8025), "8,025");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(format_duration(42.0), "42s");
+        assert_eq!(format_duration(125.0), "2m 05s");
+        assert_eq!(format_duration(8460.0), "2h 21m");
+        assert_eq!(format_bytes(1_946_220), "1.9 MB");
+    }
 }
+
+#[cfg(test)]
+mod replay_note_tests {
+    use super::*;
+
+    fn event(seq: u64, id: &str, s: u32, kind: &str, data: serde_json::Value) -> Event {
+        Event {
+            sequence: seq,
+            id: id.into(),
+            segment_id: "seg".into(),
+            utc: format!("2026-10-20T14:00:{s:02}Z").parse().unwrap(),
+            elapsed_s: f64::from(s),
+            kind: kind.into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn notes_are_placed_when_opened_and_markers_kept() {
+        let events = vec![
+            event(1, "start", 0, "start", serde_json::json!({})),
+            event(
+                2,
+                "a",
+                5,
+                "marker",
+                serde_json::json!({"label":"Note opened","note":""}),
+            ),
+            event(
+                3,
+                "b",
+                20,
+                "marker",
+                serde_json::json!({"label":"Baseline","note":""}),
+            ),
+            event(
+                4,
+                "c",
+                40,
+                "annotation",
+                serde_json::json!({"label":"Note","note":"carotid sample","amends_id":"a"}),
+            ),
+        ];
+        let notes = replay_notes(&events);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].label, "Note");
+        assert_eq!(notes[0].text, "carotid sample");
+        assert!(notes[0].is_note);
+        assert_eq!(
+            notes[0].at, events[1].utc,
+            "note uses the time it was opened"
+        );
+        assert_eq!(notes[1].label, "Baseline");
+        assert!(!notes[1].is_note);
+    }
+}
+
+#[cfg(test)]
+mod background_capture_tests {
+    use super::*;
+    use egui_kittest::Harness;
+    use std::io::Write;
+
+    /// Monitor data must keep flowing to disk while no frames are drawn, as
+    /// when the window is minimized, hidden or behind other windows.
+    #[test]
+    fn capture_continues_to_disk_without_ui_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Root::open(temp.path().to_path_buf()).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut h = Harness::builder().build_eframe(move |cc| Desktop::new(cc, root));
+        {
+            let d = h.state_mut();
+            d.settings.source = SourceConfig {
+                mode: Source::TcpListen,
+                port,
+                hl7: false,
+                ..Default::default()
+            };
+            d.subject = "Bench".into();
+            d.title = "Minimized capture".into();
+            d.authorized = true;
+            d.start(None);
+            // End the frame so the background thread owns the recorder.
+            d.park();
+            assert!(d.recorder.is_none());
+        }
+        let mut record = vec![0; crate::waveline::RECORD_LEN];
+        record[..4].copy_from_slice(&crate::waveline::MAGIC);
+        record[4..8].copy_from_slice(&(crate::waveline::RECORD_LEN as u32).to_le_bytes());
+        const COUNT: usize = 600; // far more than the 128-chunk transport queue
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                break s;
+            }
+            assert!(Instant::now() < end, "listener did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        for _ in 0..COUNT {
+            // Small writes produce many separate transport reads.
+            for chunk in record.chunks(489) {
+                stream.write_all(chunk).unwrap();
+            }
+        }
+        stream.flush().unwrap();
+        // No UI frames are run while waiting: only the background thread polls.
+        let capture = h.state().capture.as_ref().unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let done = lock(&capture.slot)
+                .as_ref()
+                .is_some_and(|r| r.binary_records == COUNT as u64);
+            if done {
+                break;
+            }
+            assert!(Instant::now() < end, "background capture fell behind");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let dir = lock(&capture.slot).as_ref().unwrap().journal.dir.clone();
+        assert_eq!(
+            std::fs::metadata(dir.join("wire.bin")).unwrap().len(),
+            (COUNT * crate::waveline::RECORD_LEN) as u64
+        );
+        drop(stream);
+        let d = h.state_mut();
+        d.reclaim();
+        d.stop(false);
+        assert!(d.capture.is_none() && d.recorder.is_none());
+        let session = d
+            .sessions
+            .iter()
+            .find(|s| s.title == "Minimized capture")
+            .unwrap();
+        assert_eq!(session.state, "completed");
+    }
+}
+
+#[cfg(test)]
+#[path = "ui_snapshots.rs"]
+mod snapshots;

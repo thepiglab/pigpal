@@ -1,4 +1,57 @@
-# Desktop interface — October 20, 2026
+# Desktop interface — November 13, 2026 (second pass)
+
+Rebuilt from a small component kit in `src/theme.rs` so every screen shares one grid and one baseline system. The Waveline monitor canvas (`src/waveline_monitor.rs`) is unchanged.
+
+- **Kit:** vector icons, one `Btn` component (primary / secondary / ghost / danger; 28, 32 or 38 px), 34 px text fields and dropdowns of identical width, a checkbox, underline tabs with counts, menus, chips and toasts. Rows are drawn by hand with `paint_on_baseline`, so time, dot, title and actions in a row share one baseline.
+- **Files:** `ui.rs` holds state, capture logic, the sidebar, dialogs and settings; `ui_views.rs` the pages; `ui_parts.rs` the drawn rows, tiles and decoder panels.
+- **Sidebar:** brand; New recording (or a live Recording card); search; session rows with date on the title baseline and flags (Demo, Interrupted). The footer holds free space plus three icon buttons: appearance (menu), data folder, settings.
+- **Notifications:** short-lived toasts replace the permanent status bar; a background job shows a toast with a spinner. Errors stay modal.
+- **Saved session:** title, one meta line, primary Replay, Transcribe (only if audio exists) and a ⋯ menu (exports, Finder, binary inspection, resume). Underline tabs. Timeline rows use a note's own words as the heading.
+- **Settings:** modal with a left nav (General, Monitor, Audio, Transcription, Video & photos). Cancel restores everything, including a previewed appearance.
+
+# Desktop interface — November 13, 2026
+
+Visual thesis: a dark, low-glare "monitor night" workspace that sits naturally next to the Waveline canvas. Graphite surfaces, Inter type, one periwinkle accent for actions, and semantic colours reserved for state: red = recording, green = live/receiving, amber = stale or needs attention. The monitor's own vital colours (green, cyan, yellow, red) stay exclusive to the monitor canvas. Tokens and widgets live in `src/theme.rs`.
+
+Layout:
+
+- **Sidebar**: brand, New session (or a live REC card while capturing), search, compact session rows (title, subject · date, demo/interrupted flags), Settings, data folder, free disk space.
+- **New session**: one centered form with a plain-language summary of the configured input ("Listens on 10.0.0.2:12345 for 10.0.0.3 · Waveline binary decoding").
+- **Live capture**: header with RECORDING chip, timer, and Stop & save; main column with a connection strip and the Waveline view / decoder fields (or HL7 vitals and trend); right rail with microphone, quick markers, Add note, and timeline.
+- **Saved session**: title with date, duration, segment, and state tags; primary Replay Waveline; Transcribe; Export and More menus; tabs for Timeline, Transcript, Media, and Monitor data. Lifecycle rows (start, stop, connection) are hidden unless "Show recording events" is on.
+- **Replay**: full-width monitor with one transport bar (Play/Pause, previous/next record, time readout, Jump to, Display menu, scrubber). Space plays or pauses; ← and → step one record.
+- **Dialogs**: settings, note, resume, error, and close confirmation are modal with a dimmed backdrop. Cancel in Settings restores the previous values.
+
+Behavioural fixes in this pass:
+
+- The live and saved timelines previously kept only the last 300 or 1,000 journal events, so markers older than a few minutes were crowded out by wire and binary-record events. Recorder now keeps a separate timeline of every marker, note, media, and lifecycle event, and review loads timeline events for the whole session.
+- Notes appear at the time their "Note opened" placeholder was captured, and that placeholder is hidden.
+- Replay is offered only for sessions with Waveline binary input; Transcribe is enabled only when audio exists.
+
+Performance:
+
+- Rendering moved from OpenGL (glow) to wgpu (Metal on macOS, DX12/Vulkan elsewhere) with a low-power GPU preference.
+- Reactive repaint: idle screens no longer repaint every 150 ms (0 % CPU at idle). Recording repaints every 100 ms, and every 33 ms while the microphone is live or replay is playing.
+- Media file listing, free disk space, and the transcription-model check are cached instead of being recomputed every frame.
+- Review loading skips bulk `wire`/`binary_record` journal lines before JSON parsing.
+- Release builds use fat LTO with one codegen unit.
+
+Capture reliability (data first):
+
+- The recorder runs on a dedicated background thread (`BackgroundCapture` in `src/ui.rs`) that polls every 20 ms, writes `wire.bin`, the journal and the live CSV, and syncs to disk each second. The window only borrows the recorder while a frame is drawn, so a hidden, minimized or unfocused window never pauses capture. The audio stream lives on its own thread, which keeps the recorder `Send`. `capture_continues_to_disk_without_ui_frames` streams 600 Waveline records over TCP with no frames drawn and checks every byte reaches disk.
+- While recording, Pig Pal holds a macOS user-initiated, latency-critical activity (`src/platform.rs`), so App Nap cannot throttle it and the Mac does not idle-sleep. The display may still sleep.
+- An unfocused window redraws once a second; a hidden one is not drawn at all.
+
+Appearance: System / Light / Dark in the sidebar footer, saved in `settings.json`. System follows macOS live. The Waveline canvas stays dark in every mode, like the device.
+
+Notes in replay: markers and notes appear as ticks on the scrubber, as a banner naming the note at the current moment, and as a clickable list beside the monitor. Clicking any of them, using ⏴ Note / Note ⏵, or pressing `[` / `]` jumps to that moment and pauses there, so the monitor shows the vitals at that time. A note is placed at the time it was opened. Each note on the saved-session timeline has a ⏵ Replay button that opens the replay at that moment.
+
+Headless screenshots of every screen: `PIGPAL_SNAPSHOT_DIR=<out> PIGPAL_SNAPSHOT_DATA=<copy of a data dir> cargo test --release --lib snapshots -- --ignored` (copies the data again into a temporary folder; originals are never opened for writing).
+
+---
+
+## Previous light design — October 20, 2026
+
 
 Visual thesis: a quiet, light research workspace with warm neutral surfaces, precise Inter typography, one green accent, and a dark audio strip as the live visual anchor.
 

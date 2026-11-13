@@ -88,8 +88,12 @@ struct Block {
     elapsed: f64,
     gap: bool,
 }
+/// The platform audio stream cannot move between threads, so it lives on its own
+/// small thread for its whole life. That keeps `Microphone` (and the recorder that
+/// owns it) `Send`, which lets capture run independently of the window.
 pub struct Microphone {
-    stream: Option<cpal::Stream>,
+    stream_stop: Option<Sender<()>>,
+    stream_thread: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     pub rx: Receiver<AudioEvent>,
     pub levels: Receiver<Level>,
@@ -109,111 +113,67 @@ impl Microphone {
         // Anchor before any device/permission calls, keeping live samples on the
         // session timeline even when initial device setup takes time.
         let clock = Instant::now();
-        let host = cpal::default_host();
-        let device = host
-            .devices()?
-            .find(|d| d.name().ok().as_deref() == Some(device_name))
-            .context("Selected microphone is unavailable. Choose an input device.")?;
-        let supported = device.default_input_config()?;
-        let format = supported.sample_format();
-        let config: cpal::StreamConfig = supported.into();
         let (tx, rx) = mpsc::sync_channel::<Block>(64);
         let (out, events) = mpsc::channel();
         // A slow renderer may lose display frames, never recorded samples.
         let (level_tx, levels) = mpsc::sync_channel(320);
         let failed = Arc::new(AtomicBool::new(false));
-        let err_flag = failed.clone();
-        let err_out = out.clone();
-        let error = move |e| {
-            err_flag.store(true, Ordering::Relaxed);
-            let _ = err_out.send(AudioEvent::Error(format!(
-                "Microphone interrupted: {e}. Restart explicitly."
-            )));
-        };
-        let channels = config.channels as usize;
-        let rate = config.sample_rate.0;
-        let mut meter = Meter::new(rate);
-        let flag = failed.clone();
-        let drop_out = out.clone();
-        let mut previous: Option<(cpal::StreamInstant, f64)> = None;
-        let mut deliver = move |samples: Vec<f32>, info: &cpal::InputCallbackInfo| {
-            if flag.load(Ordering::Relaxed) {
-                return;
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let stream_failed = failed.clone();
+        let stream_out = out.clone();
+        let name = device_name.to_string();
+        let stream_thread = thread::Builder::new()
+            .name("pigpal-audio-stream".into())
+            .spawn(move || {
+                let built = build_stream(
+                    &name,
+                    elapsed,
+                    clock,
+                    tx,
+                    level_tx,
+                    stream_failed,
+                    stream_out,
+                );
+                let stream = match built {
+                    Ok((stream, rate)) => {
+                        let _ = ready_tx.send(Ok(rate));
+                        stream
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                };
+                // Block until stop is requested or the Microphone is dropped.
+                let _ = stop_rx.recv();
+                let _ = stream.pause();
+                drop(stream); // Release callback sender before the writer finalizes.
+            })?;
+        let rate = match ready_rx.recv() {
+            Ok(Ok(rate)) => rate,
+            Ok(Err(e)) => {
+                let _ = stream_thread.join();
+                return Err(e);
             }
-            let capture = info.timestamp().capture;
-            let gap = previous
-                .map(|(p, d)| {
-                    capture
-                        .duration_since(&p)
-                        .map(|t| (t.as_secs_f64() - d).abs() > 0.05)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false);
-            let duration = samples.len() as f64 / rate as f64;
-            previous = Some((capture, duration));
-            let start = elapsed + clock.elapsed().as_secs_f64() - duration;
-            if gap {
-                meter.reset();
+            Err(_) => {
+                let _ = stream_thread.join();
+                bail!("Microphone setup stopped unexpectedly");
             }
-            meter.push(&samples, start, rate, |level| {
-                let _ = level_tx.try_send(level);
-            });
-            // Receipt minus block duration is an estimate, not calibrated hardware time.
-            let block = Block {
-                samples,
-                at: utc() - chrono::Duration::microseconds((duration * 1e6) as i64),
-                elapsed: start,
-                gap,
-            };
-            if tx.try_send(block).is_err() {
-                flag.store(true, Ordering::Relaxed);
-                let _=drop_out.send(AudioEvent::Error("Audio queue overflow: capture stopped, received samples retained. Restart microphone explicitly.".into()));
-            }
-        };
-        let stream = match format {
-            cpal::SampleFormat::F32 => device.build_input_stream(
-                &config,
-                move |d: &[f32], i| deliver(d.chunks(channels).map(|s| s[0]).collect(), i),
-                error,
-                None,
-            )?,
-            cpal::SampleFormat::I16 => device.build_input_stream(
-                &config,
-                move |d: &[i16], i| {
-                    deliver(
-                        d.chunks(channels).map(|s| s[0] as f32 / 32768.0).collect(),
-                        i,
-                    )
-                },
-                error,
-                None,
-            )?,
-            cpal::SampleFormat::U16 => device.build_input_stream(
-                &config,
-                move |d: &[u16], i| {
-                    deliver(
-                        d.chunks(channels)
-                            .map(|s| (s[0] as f32 - 32768.0) / 32768.0)
-                            .collect(),
-                        i,
-                    )
-                },
-                error,
-                None,
-            )?,
-            _ => bail!("This input sample format is unsupported; choose another microphone"),
         };
         let name = device_name.to_string();
         let writer_flag = failed.clone();
-        let writer = thread::spawn(move || {
-            if let Err(e) = write_blocks(&dir, &name, rate, rx, &out) {
-                writer_flag.store(true, Ordering::Relaxed);
-                let _ = out.send(AudioEvent::Error(format!("Audio storage failed: {e:#}")));
-            }
-        });
-        stream.play()?;
+        let writer = thread::Builder::new()
+            .name("pigpal-audio-writer".into())
+            .spawn(move || {
+                if let Err(e) = write_blocks(&dir, &name, rate, rx, &out) {
+                    writer_flag.store(true, Ordering::Relaxed);
+                    let _ = out.send(AudioEvent::Error(format!("Audio storage failed: {e:#}")));
+                }
+            })?;
         Ok(Self {
-            stream: Some(stream),
+            stream_stop: Some(stop_tx),
+            stream_thread: Some(stream_thread),
             writer: Some(writer),
             rx: events,
             levels,
@@ -224,9 +184,11 @@ impl Microphone {
         self.failed.load(Ordering::Relaxed)
     }
     pub fn stop(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            let _ = stream.pause();
-            drop(stream); // Release callback sender before draining/finalizing the writer.
+        // Stopping the stream thread drops the stream and its callback sender,
+        // so the writer drains every queued block and finalizes the WAV.
+        drop(self.stream_stop.take());
+        if let Some(thread) = self.stream_thread.take() {
+            let _ = thread.join();
         }
         if let Some(writer) = self.writer.take() {
             let _ = writer.join();
@@ -238,6 +200,109 @@ impl Drop for Microphone {
         self.stop();
     }
 }
+/// Open the selected input and start its stream on the calling thread.
+fn build_stream(
+    device_name: &str,
+    elapsed: f64,
+    clock: Instant,
+    tx: mpsc::SyncSender<Block>,
+    level_tx: mpsc::SyncSender<Level>,
+    failed: Arc<AtomicBool>,
+    out: Sender<AudioEvent>,
+) -> Result<(cpal::Stream, u32)> {
+    let host = cpal::default_host();
+    let device = host
+        .devices()?
+        .find(|d| d.name().ok().as_deref() == Some(device_name))
+        .context("Selected microphone is unavailable. Choose an input device.")?;
+    let supported = device.default_input_config()?;
+    let format = supported.sample_format();
+    let config: cpal::StreamConfig = supported.into();
+    let err_flag = failed.clone();
+    let err_out = out.clone();
+    let error = move |e| {
+        err_flag.store(true, Ordering::Relaxed);
+        let _ = err_out.send(AudioEvent::Error(format!(
+            "Microphone interrupted: {e}. Restart explicitly."
+        )));
+    };
+    let channels = config.channels as usize;
+    let rate = config.sample_rate.0;
+    let mut meter = Meter::new(rate);
+    let flag = failed.clone();
+    let drop_out = out.clone();
+    let mut previous: Option<(cpal::StreamInstant, f64)> = None;
+    let mut deliver = move |samples: Vec<f32>, info: &cpal::InputCallbackInfo| {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        let capture = info.timestamp().capture;
+        let gap = previous
+            .map(|(p, d)| {
+                capture
+                    .duration_since(&p)
+                    .map(|t| (t.as_secs_f64() - d).abs() > 0.05)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+        let duration = samples.len() as f64 / rate as f64;
+        previous = Some((capture, duration));
+        let start = elapsed + clock.elapsed().as_secs_f64() - duration;
+        if gap {
+            meter.reset();
+        }
+        meter.push(&samples, start, rate, |level| {
+            let _ = level_tx.try_send(level);
+        });
+        // Receipt minus block duration is an estimate, not calibrated hardware time.
+        let block = Block {
+            samples,
+            at: utc() - chrono::Duration::microseconds((duration * 1e6) as i64),
+            elapsed: start,
+            gap,
+        };
+        if tx.try_send(block).is_err() {
+            flag.store(true, Ordering::Relaxed);
+            let _=drop_out.send(AudioEvent::Error("Audio queue overflow: capture stopped, received samples retained. Restart microphone explicitly.".into()));
+        }
+    };
+    let stream = match format {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |d: &[f32], i| deliver(d.chunks(channels).map(|s| s[0]).collect(), i),
+            error,
+            None,
+        )?,
+        cpal::SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |d: &[i16], i| {
+                deliver(
+                    d.chunks(channels).map(|s| s[0] as f32 / 32768.0).collect(),
+                    i,
+                )
+            },
+            error,
+            None,
+        )?,
+        cpal::SampleFormat::U16 => device.build_input_stream(
+            &config,
+            move |d: &[u16], i| {
+                deliver(
+                    d.chunks(channels)
+                        .map(|s| (s[0] as f32 - 32768.0) / 32768.0)
+                        .collect(),
+                    i,
+                )
+            },
+            error,
+            None,
+        )?,
+        _ => bail!("This input sample format is unsupported; choose another microphone"),
+    };
+    stream.play()?;
+    Ok((stream, rate))
+}
+
 fn write_blocks(
     dir: &Path,
     device: &str,

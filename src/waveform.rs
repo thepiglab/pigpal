@@ -1,6 +1,6 @@
 //! A bounded, display-only view of the saved microphone channel.
 use crate::audio::Level;
-use eframe::egui::{self, Color32, Vec2};
+use eframe::egui::{self, Vec2};
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -43,16 +43,18 @@ impl Waveform {
             Some(db),
         )
     }
-    pub fn show(&self, ui: &mut egui::Ui, now: f64, active: bool) {
+    pub fn show(&self, ui: &mut egui::Ui, now: f64, active: bool, height: f32) {
         let now = if active {
             now
         } else {
             self.frames.back().map_or(now, |f| f.elapsed)
         };
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), 94.0), egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), height),
+            egui::Sense::hover(),
+        );
         let painter = ui.painter_at(rect);
-        let baseline = Color32::from_rgb(54, 78, 74);
+        let baseline = crate::theme::line_strong();
         painter.line_segment(
             [
                 egui::pos2(rect.left(), rect.center().y),
@@ -71,14 +73,15 @@ impl Waveform {
             let x = rect.right() - (age / 8.0) as f32 * rect.width();
             // Fixed logarithmic mapping, no automatic normalization of noise into "speech".
             let db = 20.0 * v.peak.max(0.001).log10();
-            let height =
-                (2.0 + ((db + 60.0) / 60.0).clamp(0.0, 1.0).powf(1.5) * 82.0).min(rect.height());
+            let height = (2.0
+                + ((db + 60.0) / 60.0).clamp(0.0, 1.0).powf(1.5) * (rect.height() - 4.0))
+                .min(rect.height());
             let color = if !active {
-                baseline
+                crate::theme::muted()
             } else if v.peak >= 0.98 {
-                Color32::from_rgb(255, 178, 131)
+                crate::theme::warn()
             } else {
-                Color32::from_rgb(128, 232, 204)
+                crate::theme::accent()
             };
             painter.rect_filled(
                 egui::Rect::from_center_size(

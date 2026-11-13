@@ -283,6 +283,75 @@ pub fn visit_events(dir: &Path, mut visit: impl FnMut(Event) -> Result<()>) -> R
     }
     Ok(warnings)
 }
+/// Events a person reviews in a saved session.
+#[derive(Default)]
+pub struct ReviewEvents {
+    /// Every timeline event (markers, notes, audio, media, lifecycle) across all segments.
+    pub timeline: Vec<Event>,
+    /// The most recent decoded HL7 messages, oldest first.
+    pub messages: std::collections::VecDeque<Event>,
+    pub warnings: Vec<String>,
+}
+pub const TIMELINE_KINDS: &[&str] = &[
+    "marker",
+    "annotation",
+    "audio_closed",
+    "audio_error",
+    "photo",
+    "start",
+    "stop",
+    "video_closed",
+    "video_error",
+    "connection",
+    "disconnect",
+];
+/// Scan journals for review. Unlike [`recent_events`], timeline events are kept
+/// for the whole session, so early markers are not crowded out by the high-rate
+/// wire and binary-record events. Those bulk lines are skipped before JSON parsing.
+pub fn review_events(dir: &Path, max_messages: usize) -> Result<ReviewEvents> {
+    let s: Session = read_json(&dir.join("session.json"))?;
+    let mut out = ReviewEvents::default();
+    for segment in s.segments {
+        let path = dir.join("segments").join(segment.id).join("journal.ndjson");
+        let mut reader = match File::open(&path) {
+            Ok(f) => BufReader::with_capacity(1 << 16, f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                out.warnings.push(format!(
+                    "Incomplete journal tail retained: {}",
+                    path.display()
+                ));
+                break;
+            }
+            // Serialized field order puts `kind` before `data`, and any quote inside
+            // user text is escaped, so this substring test cannot misfire on notes.
+            if line.contains("\"kind\":\"wire\"") || line.contains("\"kind\":\"binary_record\"") {
+                continue;
+            }
+            let event: Event = serde_json::from_str(&line)
+                .with_context(|| format!("Invalid complete journal line in {}", path.display()))?;
+            if event.kind == "message" {
+                if max_messages > 0 {
+                    if out.messages.len() == max_messages {
+                        out.messages.pop_front();
+                    }
+                    out.messages.push_back(event);
+                }
+            } else if TIMELINE_KINDS.contains(&event.kind.as_str()) {
+                out.timeline.push(event);
+            }
+        }
+    }
+    Ok(out)
+}
 pub fn recent_events(dir: &Path) -> Result<(std::collections::VecDeque<Event>, Vec<String>)> {
     let mut events = std::collections::VecDeque::new();
     let warnings = visit_events(dir, |e| {

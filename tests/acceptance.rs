@@ -292,6 +292,20 @@ fn waveline_binary_tcp_reassembles_records_without_promoting_hypotheses() {
         == serde_json::json!({
             "systolic":73.0, "diastolic":33.0, "mean":46.0
         })));
+    // Review keeps every timeline event and skips bulk wire/binary lines.
+    let review = store::review_events(&root.session_dir(&rec.session.id), 50).unwrap();
+    assert!(review
+        .timeline
+        .iter()
+        .any(|e| e.kind == "marker" && e.data["label"] == "Reference"));
+    assert!(review
+        .timeline
+        .iter()
+        .all(|e| e.kind != "wire" && e.kind != "binary_record"));
+    assert!(rec
+        .timeline
+        .iter()
+        .any(|e| e.kind == "marker" && e.data["note"] == "Candidate fields remain separate"));
     let export_dir = export::csvs(&root.session_dir(&rec.session.id)).unwrap();
     for path in [
         rec.journal.dir.join("waveline_live.csv"),
@@ -299,12 +313,8 @@ fn waveline_binary_tcp_reassembles_records_without_promoting_hypotheses() {
     ] {
         let mut csv = csv::Reader::from_path(path).unwrap();
         let headers = csv.headers().unwrap().clone();
-        let indices = [
-            "arterial_systolic_candidate",
-            "arterial_diastolic_candidate",
-            "arterial_mean_candidate",
-        ]
-        .map(|name| headers.iter().position(|header| header == name).unwrap());
+        let indices = ["arterial_systolic", "arterial_diastolic", "arterial_mean"]
+            .map(|name| headers.iter().position(|header| header == name).unwrap());
         let rows = csv.records().map(Result::unwrap).collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         for row in rows {

@@ -14,7 +14,7 @@ pub const MAGIC: [u8; 4] = [1, 2, 0x5b, 0xf6];
 pub const RECORD_LEN: usize = 1956;
 pub const STALE_AFTER_S: f64 = 3.0;
 
-/// Separate from cuff-pressure candidates. None at the record level means
+/// Separate from cuff-pressures. None at the record level means
 /// no arterial decoding was persisted (for example, a legacy record).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ArterialPressure {
@@ -39,7 +39,7 @@ impl ArterialPressure {
             values[1].map(|v| v.to_string()).unwrap_or_default(),
             values[2].map(|v| v.to_string()).unwrap_or_default(),
             if values.iter().any(Option::is_some) {
-                "candidate"
+                "received"
             } else {
                 "unavailable"
             }
@@ -47,6 +47,37 @@ impl ArterialPressure {
         ]
     }
 }
+
+pub const CSV_HEADER: [&str; 28] = [
+    "received_utc",
+    "elapsed_s",
+    "connection",
+    "source",
+    "connection_offset",
+    "record_length",
+    "timestamp_basis",
+    "mapping_verified",
+    "heart_rate",
+    "respiration",
+    "systolic",
+    "diastolic",
+    "mean_pressure",
+    "spo2",
+    "pulse_rate",
+    "temperature_1",
+    "temperature_2",
+    "arterial_systolic",
+    "arterial_diastolic",
+    "arterial_mean",
+    "arterial_status",
+    "row_type",
+    "stream_status",
+    "last_complete_record_age_s",
+    "ecg_raw_samples_json",
+    "pleth_raw_samples_json",
+    "respiration_raw_samples_json",
+    "p1_raw_samples_json",
+];
 
 /// A derived, append-only view; wire.bin and the journal remain the originals.
 pub struct LiveCsv {
@@ -61,32 +92,7 @@ impl LiveCsv {
             .create_new(true)
             .open(dir.join("waveline_live.csv"))?;
         let mut writer = csv::Writer::from_writer(file);
-        writer.write_record([
-            "received_utc",
-            "elapsed_s",
-            "connection",
-            "source",
-            "connection_offset",
-            "record_length",
-            "timestamp_basis",
-            "mapping_verified",
-            "heart_rate_candidate",
-            "respiration_candidate",
-            "systolic_candidate",
-            "diastolic_candidate",
-            "mean_pressure_candidate",
-            "spo2_candidate",
-            "pulse_rate_candidate",
-            "temperature_1_candidate",
-            "temperature_2_candidate",
-            "arterial_systolic_candidate",
-            "arterial_diastolic_candidate",
-            "arterial_mean_candidate",
-            "arterial_status",
-            "row_type",
-            "stream_status",
-            "last_complete_record_age_s",
-        ])?;
+        writer.write_record(CSV_HEADER)?;
         writer.flush()?;
         Ok(Self {
             writer,
@@ -102,24 +108,13 @@ impl LiveCsv {
         utc: chrono::DateTime<chrono::Utc>,
         elapsed_s: f64,
     ) -> Result<()> {
-        let mut row = vec![
-            utc.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            format!("{elapsed_s:.9}"),
-            connection.into(),
-            peer.into(),
-            record.stream_offset.to_string(),
-            RECORD_LEN.to_string(),
-            "transport_read_completion".into(),
-            "false".into(),
-        ];
-        row.extend(
-            record
-                .fields
-                .iter()
-                .map(|f| f.value.map(|v| v.to_string()).unwrap_or_default()),
-        );
-        row.extend(ArterialPressure::cells(record.arterial_pressure.as_ref()));
-        row.extend(["record".into(), "receiving".into(), "0".into()]);
+        let row = record.csv_row(
+            connection,
+            peer,
+            utc,
+            Some(elapsed_s),
+            "transport_read_completion",
+        )?;
         // All text columns come from local socket metadata, not device text.
         self.writer.write_record(row)?;
         // Expose each complete record to tail/readers before capture stops.
@@ -142,7 +137,7 @@ impl LiveCsv {
         {
             return Ok(None);
         }
-        let mut row = vec![String::new(); 24];
+        let mut row = vec![String::new(); CSV_HEADER.len()];
         row[0] = utc.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         row[1] = format!("{elapsed_s:.9}");
         row[6] = "host_gap_check".into();
@@ -174,7 +169,17 @@ pub struct Field {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SignalSlice {
     pub offset: usize,
+    pub hypothesis: &'static str,
     pub samples: Vec<u8>,
+}
+/// Raw channel state bytes retained separately from the numeric candidates.
+/// Only the exact photo-supported signature is used to hide a missing SpO2 display.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ChannelStatus {
+    pub ecg: u8,
+    pub pleth: u8,
+    pub p1: u8,
+    pub p2: u8,
 }
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Record {
@@ -182,9 +187,61 @@ pub struct Record {
     pub stream_offset: u64,
     pub fields: Vec<Field>,
     pub signal_slices: Vec<SignalSlice>,
+    pub channel_status: ChannelStatus,
     pub arterial_pressure: Option<ArterialPressure>,
 }
 impl Record {
+    /// One receipt row retains every waveform sample in ordered JSON arrays.
+    /// No per-sample acquisition time or calibrated amplitude is invented.
+    pub fn csv_row(
+        &self,
+        connection: &str,
+        peer: &str,
+        utc: chrono::DateTime<chrono::Utc>,
+        elapsed_s: Option<f64>,
+        timestamp_basis: &str,
+    ) -> Result<Vec<String>> {
+        let mut row = vec![
+            utc.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            elapsed_s
+                .filter(|v| v.is_finite())
+                .map(|v| format!("{v:.9}"))
+                .unwrap_or_default(),
+            crate::export::safe_cell(connection),
+            crate::export::safe_cell(peer),
+            self.stream_offset.to_string(),
+            RECORD_LEN.to_string(),
+            timestamp_basis.into(),
+            "false".into(),
+        ];
+        row.extend(self.fields.iter().map(|f| {
+            f.value
+                .filter(|v| v.is_finite())
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+        }));
+        row.extend(ArterialPressure::cells(self.arterial_pressure.as_ref()));
+        row.extend(["record".into(), "receiving".into(), "0".into()]);
+        for offset in [180, 356, 424, 668] {
+            row.push(
+                self.signal_slices
+                    .iter()
+                    .find(|s| s.offset == offset)
+                    .map(|s| serde_json::to_string(&s.samples))
+                    .transpose()?
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(row)
+    }
+    pub fn spo2_sensor_off_candidate(&self) -> bool {
+        self.channel_status.pleth == 2
+            && [64, 66].into_iter().all(|offset| {
+                self.fields
+                    .iter()
+                    .any(|f| f.offset == offset && f.value == Some(0.0))
+            })
+    }
     pub fn decode(data: &[u8], stream_offset: u64) -> Result<Self> {
         ensure!(data.len() == RECORD_LEN, "Unexpected binary record size");
         ensure!(data[..4] == MAGIC, "Unrecognized binary record signature");
@@ -194,13 +251,13 @@ impl Record {
         );
         let mut fields = Vec::new();
         for (offset, hypothesis) in [
-            (14, "Heart rate candidate"),
-            (20, "Respiration candidate"),
-            (28, "Systolic pressure candidate"),
-            (30, "Diastolic pressure candidate"),
-            (32, "Mean pressure candidate"),
-            (64, "Saturation candidate"),
-            (66, "Pulse rate candidate"),
+            (14, "Heart rate"),
+            (20, "Respiration (not CO2 RR)"),
+            (28, "Systolic pressure"),
+            (30, "Diastolic pressure"),
+            (32, "Mean pressure"),
+            (64, "Saturation"),
+            (66, "Pulse rate"),
         ] {
             fields.push(Field {
                 offset,
@@ -212,10 +269,7 @@ impl Record {
                 raw_hex: hex(&data[offset..offset + 2]),
             });
         }
-        for (offset, hypothesis) in [
-            (68, "Temperature 1 candidate"),
-            (72, "Temperature 2 candidate"),
-        ] {
+        for (offset, hypothesis) in [(68, "Temperature 1 (Celsius)"), (72, "Temperature 2")] {
             let value = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             fields.push(Field {
                 offset,
@@ -228,6 +282,12 @@ impl Record {
         Ok(Self {
             stream_offset,
             fields,
+            channel_status: ChannelStatus {
+                ecg: data[89],
+                pleth: data[349],
+                p1: data[661],
+                p2: data[797],
+            },
             // Connected P1 display reference, October 20: approximately 73/33,
             // MAP 44, while the independent cuff triplet held at 76/60/65.
             // Negative values in the captured stream establish signed 32-bit
@@ -238,13 +298,22 @@ impl Record {
                 diastolic: Some(i32::from_le_bytes(data[40..44].try_into().unwrap()) as f64),
                 mean: Some(i32::from_le_bytes(data[44..48].try_into().unwrap()) as f64),
             }),
-            signal_slices: [(180, 72), (356, 60), (424, 128)]
-                .into_iter()
-                .map(|(offset, len)| SignalSlice {
-                    offset,
-                    samples: data[offset..offset + len].to_vec(),
-                })
-                .collect(),
+            // Photo comparisons support channel identity, not calibration or
+            // sample timestamps. Retain unsigned bytes including flat/clipped
+            // blocks; these are not calibrated ECG or pressure measurements.
+            signal_slices: [
+                (180, 72, "ECG waveform"),
+                (356, 60, "Pleth waveform"),
+                (424, 128, "Respiration waveform (not CO2)"),
+                (668, 128, "P1 waveform"),
+            ]
+            .into_iter()
+            .map(|(offset, len, hypothesis)| SignalSlice {
+                offset,
+                hypothesis,
+                samples: data[offset..offset + len].to_vec(),
+            })
+            .collect(),
         })
     }
 }
@@ -360,6 +429,34 @@ mod tests {
         b
     }
     #[test]
+    fn photo_reference_keeps_gas_rr_separate_and_retains_p1_wave_bytes() {
+        let mut b = sample();
+        // 11:57:32 EDT photo: HR 110, P1 127/87/100, T1 98.6 F.
+        // The preceding receipt has raw RESP 54, whereas photo gas RR is 7.
+        b[14..16].copy_from_slice(&110_u16.to_le_bytes());
+        b[20..22].copy_from_slice(&54_u16.to_le_bytes());
+        b[68..72].copy_from_slice(&37.0_f32.to_le_bytes());
+        for (offset, value) in [(36, 127_i32), (40, 87), (44, 100)] {
+            b[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // Deliberately include endpoints to catch normalization or clipping.
+        for (i, value) in b[668..796].iter_mut().enumerate() {
+            *value = if i % 2 == 0 { 0 } else { 255 };
+        }
+        let r = Record::decode(&b, 0).unwrap();
+        assert_eq!(r.fields.len(), 9); // Live CSV schema remains compatible.
+        assert_eq!(r.fields[1].value, Some(54.0));
+        assert!(r.fields[1].hypothesis.contains("not CO2 RR"));
+        assert_eq!(r.fields[7].value, Some(37.0));
+        assert_eq!(
+            ArterialPressure::cells(r.arterial_pressure.as_ref()),
+            ["127", "87", "100", "received"]
+        );
+        assert_eq!(r.signal_slices.len(), 4);
+        assert_eq!(r.signal_slices[3].offset, 668);
+        assert_eq!(r.signal_slices[3].samples, b[668..796]);
+    }
+    #[test]
     fn every_fragment_boundary_preserves_raw_numbers_and_signal_slices() {
         let b = sample();
         let expected = Record::decode(&b, 0).unwrap();
@@ -425,7 +522,7 @@ mod tests {
         let mut record = Record::decode(&bytes, 1956).unwrap();
         assert_eq!(
             ArterialPressure::cells(record.arterial_pressure.as_ref()),
-            ["73", "33", "46", "candidate"]
+            ["73", "33", "46", "received"]
         );
         assert_eq!(record.fields[2].value, Some(76.0));
         assert_eq!(record.fields[3].value, Some(60.0));
@@ -435,7 +532,7 @@ mod tests {
         record = Record::decode(&bytes, 0).unwrap();
         assert_eq!(
             ArterialPressure::cells(record.arterial_pressure.as_ref()),
-            ["38", "-24", "-3", "candidate"]
+            ["38", "-24", "-3", "received"]
         );
         let temp = tempfile::tempdir().unwrap();
         let mut writer = LiveCsv::create(temp.path()).unwrap();
@@ -450,7 +547,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (&row[17], &row[18], &row[19], &row[20]),
-            ("38", "-24", "-3", "candidate")
+            ("38", "-24", "-3", "received")
         );
     }
     #[test]
@@ -483,6 +580,10 @@ mod tests {
             assert_eq!(&gap[20], "stale");
             assert_eq!(&gap[21], "missing");
             assert_eq!(&gap[22], "stale");
+            assert!(
+                gap.iter().skip(24).all(str::is_empty),
+                "Gaps must not repeat waveform arrays"
+            );
         }
         // A future independently mapped decoder may supply signed/zero values.
         // Neither zero nor an unchanged value implies loss of a sample.
@@ -497,7 +598,7 @@ mod tests {
         assert_eq!(&rows[3][17], "0");
         assert_eq!(&rows[3][18], "-2");
         assert_eq!(&rows[3][19], "");
-        assert_eq!(&rows[3][20], "candidate");
+        assert_eq!(&rows[3][20], "received");
         assert_eq!(&rows[4][22], "receiving");
         assert_eq!(csv.append_stale(utc, 7.9).unwrap(), None);
         assert_eq!(

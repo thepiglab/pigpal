@@ -18,6 +18,21 @@ fn main() -> Result<()> {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
+    if let Some(path) = value("--export-waveline") {
+        let output =
+            value("--output-dir").context("--export-waveline requires a new --output-dir")?;
+        let capture = pigpal::replay::Capture::load(&PathBuf::from(path))?;
+        let output = PathBuf::from(output);
+        std::fs::create_dir(&output).context(
+            "Use a new output directory; existing files are never replaced by this command",
+        )?;
+        pigpal::waveline_csv::write_capture(&capture, &output)?;
+        println!(
+            "{}",
+            serde_json::json!({"directory":output,"records":capture.frames.len(),"warnings":capture.warnings})
+        );
+        return Ok(());
+    }
     if let Some(path) = value("--inspect-waveline") {
         let path = PathBuf::from(path);
         let inspection = if path.is_dir() {
@@ -26,6 +41,26 @@ fn main() -> Result<()> {
             pigpal::waveline::inspect_file(&path)?
         };
         println!("{}", serde_json::to_string_pretty(&inspection)?);
+        return Ok(());
+    }
+    if let Some(path) = value("--inspect-replay") {
+        let mut player =
+            pigpal::replay::Player::new(pigpal::replay::Capture::load(&PathBuf::from(path))?);
+        if let Some(at) = value("--replay-at") {
+            player.seek(pigpal::replay::parse_time(&at, player.cursor)?)?;
+        }
+        let frame = player.frame();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "records":player.capture.frames.len(),"cursor_utc":player.cursor,
+                "record_index":player.index,"record_age_s":player.age(),
+                "display_has_data":player.age().is_some_and(|age| age<=pigpal::waveline::STALE_AFTER_S),
+                "received_utc":frame.map(|f|f.utc),
+                "timestamp_basis":frame.map(|f|&f.timestamp_basis),
+                "record":frame.map(|f|&f.record),"warnings":player.capture.warnings,
+            }))?
+        );
         return Ok(());
     }
     let root = Root::open(
@@ -85,14 +120,39 @@ fn main() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Pig Pal")
-            .with_inner_size([1220.0, 840.0])
+            .with_inner_size([1320.0, 860.0])
             .with_min_inner_size([940.0, 680.0]),
+        // Native Metal / DX12 / Vulkan through wgpu instead of OpenGL, which
+        // macOS has deprecated. Low-power GPU selection keeps laptops cool.
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    power_preference: eframe::wgpu::PowerPreference::LowPower,
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        },
         ..Default::default()
     };
     eframe::run_native(
         "Pig Pal",
         options,
-        Box::new(move |cc| Ok(Box::new(Desktop::new(cc, root)))),
+        Box::new(move |cc| {
+            let mut desktop = Desktop::new(cc, root);
+            if let Some(index) = args.iter().position(|arg| arg == "--replay") {
+                if let Some(id) = args.get(index + 1) {
+                    let at = args
+                        .iter()
+                        .position(|arg| arg == "--replay-at")
+                        .and_then(|i| args.get(i + 1))
+                        .cloned();
+                    desktop.open_replay(id.clone(), at);
+                }
+            }
+            Ok(Box::new(desktop))
+        }),
     )
     .map_err(|e| anyhow::anyhow!(e.to_string()))
 }

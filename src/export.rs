@@ -52,7 +52,14 @@ pub fn csvs(dir: &Path) -> Result<PathBuf> {
         session.state != "recording",
         "Stop capture before exporting"
     );
-    let dest = dir.join("exports");
+    let exports = dir.join("exports");
+    // Preserve earlier exports, including the original pig 6 tables. A later
+    // export gets a new directory rather than rewriting an existing schema.
+    let dest = if exports.exists() {
+        exports.join(format!("export-{}", store::id()))
+    } else {
+        exports
+    };
     fs::create_dir_all(&dest)?;
     let mut obs = csv::Writer::from_path(dest.join("observations.csv"))?;
     obs.write_record([
@@ -101,7 +108,7 @@ pub fn csvs(dir: &Path) -> Result<PathBuf> {
         "field_offset",
         "encoding",
         "hypothesis",
-        "numeric_candidate",
+        "numeric",
         "raw_hex",
         "experimental",
         "mapping_verified",
@@ -117,9 +124,9 @@ pub fn csvs(dir: &Path) -> Result<PathBuf> {
         "elapsed_s",
         "connection",
         "source",
-        "arterial_systolic_candidate",
-        "arterial_diastolic_candidate",
-        "arterial_mean_candidate",
+        "arterial_systolic",
+        "arterial_diastolic",
+        "arterial_mean",
         "arterial_status",
         "timestamp_basis",
         "last_complete_record_age_s",
@@ -244,6 +251,9 @@ pub fn csvs(dir: &Path) -> Result<PathBuf> {
         }
         Ok(())
     })?;
+    if let Some(capture) = crate::replay::Capture::load_optional(dir)? {
+        crate::waveline_csv::write_capture(&capture, &dest)?;
+    }
     obs.flush()?;
     events.flush()?;
     binary.flush()?;
@@ -302,7 +312,7 @@ pub fn csvs(dir: &Path) -> Result<PathBuf> {
     }
     transcripts.flush()?;
     words.flush()?;
-    fs::write(dest.join("READ_ME.txt"),format!("Pig Pal schema 2. Synthetic: {}.\nOriginal records: segments/*/journal.ndjson, wire.bin, audio WAVs and sidecars.\nUTC is host time, not monitor acquisition time. Elapsed time restarts in each segment.\nWaveline timestamp_basis distinguishes transport_read_completion from legacy_journal_processing. New records use the read that completes the record; multiple records in one read share a timestamp. Full timestamp precision is retained. journaled_utc and journaled_elapsed_s preserve processing times separately.\nEach new raw segment also includes waveline_live.csv, flushed after every complete record, with nine fractional UTC digits and monotonic elapsed time. Decimal precision does not establish clock accuracy or monitor acquisition timing.\nNew arterial SYS/DIA/MAP candidates decode signed i32 LE bytes 36/40/44, supported by a connected P1 display reference. Legacy journal records without arterial decoding remain blank/unmapped; original wire bytes are retained for retrospective decoding. Channel validity and units remain unverified. Cuff-pressure candidates are separate. After >3 seconds without complete records, new live files write blank missing rows at most once per second (host_gap_check). Unchanged numbers are not proof of staleness; channel validity flags remain unknown.\nRepeated cuff values are not new cuff measurements. No interpolation or guessed vendor code mapping.\nWaveline binary candidates are in waveline_candidates.csv, one row per field per record, separate from observations.csv. Names and units remain hypotheses. Zeros and other possible unavailable codes are preserved literally; validity and freshness are unknown. Connection offsets restart on reconnect. Original signal bytes remain in wire.bin.\nAudio pauses remain gaps. Text and word timestamps are unverified model outputs. Original audio is preserved.\nCSV text is escaped against spreadsheet formulas. Original text remains in JSON.\nArchives are not encrypted.\n{}\n",session.synthetic,warnings.join("\n")))?;
+    fs::write(dest.join("READ_ME.txt"),format!("Pig Pal schema 2. Synthetic: {}.\nOriginal records: segments/*/journal.ndjson, wire.bin, audio WAVs and sidecars.\nUTC is host time, not monitor acquisition time. Elapsed time restarts in each segment.\nWaveline timestamp_basis distinguishes transport_read_completion from legacy_journal_processing. New records use the read that completes the record; multiple records in one read share a timestamp. Full timestamp precision is retained. journaled_utc and journaled_elapsed_s preserve processing times separately.\nEach new raw segment also includes waveline_live.csv, flushed after every complete record, with nine fractional UTC digits and monotonic elapsed time. Decimal precision does not establish clock accuracy or monitor acquisition timing.\nArterial SYS/DIA/MAP values decode signed i32 LE bytes 36/40/44, supported by a connected P1 display reference. Legacy journal records without arterial decoding remain blank/unmapped; original wire bytes are retained for retrospective decoding. Channel validity and units remain unverified. Cuff pressures are separate. After >3 seconds without complete records, new live files write blank missing rows at most once per second (host_gap_check). Unchanged numbers are not proof of staleness; channel validity flags remain unknown.\nRepeated cuff values are not new cuff measurements. No interpolation or guessed vendor code mapping.\nLegacy-format binary fields are in waveline_candidates.csv, one row per field per record, separate from observations.csv. Names and units remain hypotheses. Zeros and other possible unavailable codes are preserved literally; validity and freshness are unknown. Connection offsets restart on reconnect. Original signal bytes remain in wire.bin.\nNew waveline_readings.csv and waveline_waveforms.csv reconstruct all mapped scalar and waveform values from the saved raw stream. The readings table has complete ordered JSON sample arrays; the waveform table has one row per raw byte sample. Only block receipt times are known; sample indices are not exact acquisition times. Receipt-based rate estimates are explicitly labeled and blank for gaps/batches. See waveline_csv_README.txt.\nAudio pauses remain gaps. Text and word timestamps are unverified model outputs. Original audio is preserved.\nCSV text is escaped against spreadsheet formulas. Original text remains in JSON.\nArchives are not encrypted.\n{}\n",session.synthetic,warnings.join("\n")))?;
     Ok(dest)
 }
 pub fn archive(dir: &Path, dest: &Path, media: bool) -> Result<()> {
@@ -373,7 +383,7 @@ mod tests {
         let mut data = serde_json::json!({
             "connection":"test", "peer":"10.0.0.3:1234", "connection_offset":0,
             "record_length":1956,"experimental":true,"mapping_verified":false,
-            "fields":[{"offset":14,"encoding":"u16 LE","hypothesis":"Heart rate candidate","value":91.0,"raw_hex":"5b 00"}],
+            "fields":[{"offset":14,"encoding":"u16 LE","hypothesis":"Heart rate","value":91.0,"raw_hex":"5b 00"}],
             "received_utc":"2026-10-20T14:09:07.123456789Z",
             "received_elapsed_s":50.450164333000004_f64,
             "arterial_pressure":{"systolic":0.0,"diastolic":-2.0,"mean":null}
@@ -424,11 +434,19 @@ mod tests {
         assert_eq!(&pressure[0][6], "0");
         assert_eq!(&pressure[0][7], "-2");
         assert_eq!(&pressure[0][8], "");
-        assert_eq!(&pressure[0][9], "candidate");
+        assert_eq!(&pressure[0][9], "received");
         assert!(pressure[1].iter().skip(6).take(3).all(str::is_empty));
         assert_eq!(&pressure[1][9], "unmapped");
         assert!(pressure[2].iter().skip(6).take(3).all(str::is_empty));
         assert_eq!(&pressure[2][9], "stale");
         assert_eq!(&pressure[2][10], "host_gap_check");
+        let original = std::fs::read(dir.join("waveline_candidates.csv")).unwrap();
+        let next = csvs(&root.session_dir(&rec.session.id)).unwrap();
+        assert_ne!(next, dir);
+        assert_eq!(
+            std::fs::read(dir.join("waveline_candidates.csv")).unwrap(),
+            original
+        );
+        assert!(next.join("waveline_candidates.csv").exists());
     }
 }

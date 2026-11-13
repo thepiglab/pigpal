@@ -25,6 +25,9 @@ pub struct Recorder {
     pub session: Session,
     pub journal: Journal,
     pub events: VecDeque<Event>,
+    /// Every timeline event in this segment (markers, notes, media, lifecycle),
+    /// kept separately so high-rate wire events never crowd them out.
+    pub timeline: Vec<Event>,
     pub latest: BTreeMap<String, LiveValue>,
     pub history: VecDeque<(f64, String, f64)>,
     pub status: String,
@@ -72,6 +75,7 @@ impl Recorder {
             session,
             journal,
             events: VecDeque::new(),
+            timeline: Vec::new(),
             latest: BTreeMap::new(),
             history: VecDeque::new(),
             status: "Starting".into(),
@@ -103,6 +107,9 @@ impl Recorder {
     pub fn event(&mut self, kind: &str, data: serde_json::Value) -> Result<String> {
         let event = self.journal.append(kind, data)?;
         let id = event.id.clone();
+        if store::TIMELINE_KINDS.contains(&event.kind.as_str()) && self.timeline.len() < 20_000 {
+            self.timeline.push(event.clone());
+        }
         if self.events.len() == 300 {
             self.events.pop_front();
         }
@@ -424,6 +431,12 @@ impl Recorder {
     }
 }
 
+// Capture runs on a background thread, so the recorder must stay `Send`.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Recorder>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +487,7 @@ mod tests {
         assert!(rows[0].iter().skip(8).take(12).all(str::is_empty));
         assert_eq!(&rows[1][21], "record");
         assert_eq!(&rows[1][22], "receiving");
-        assert_eq!(&rows[1][20], "candidate");
+        assert_eq!(&rows[1][20], "received");
         assert!(rows[1].iter().skip(17).take(3).all(|cell| cell == "0"));
         let dir = crate::export::csvs(&root.session_dir(&rec.session.id)).unwrap();
         let rows = csv::Reader::from_path(dir.join("arterial_pressure.csv"))
@@ -484,7 +497,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
         assert_eq!(&rows[0][9], "stale");
-        assert_eq!(&rows[1][9], "candidate");
+        assert_eq!(&rows[1][9], "received");
         assert!(rows[1].iter().skip(6).take(3).all(|cell| cell == "0"));
     }
     #[test]
@@ -513,6 +526,11 @@ mod tests {
         record[14..16].copy_from_slice(&91_u16.to_le_bytes());
         record[30..32].copy_from_slice(&77_u16.to_le_bytes());
         record[72..76].copy_from_slice(&f32::NAN.to_le_bytes());
+        for (offset, length) in [(180, 72), (356, 60), (424, 128), (668, 128)] {
+            for j in 0..length {
+                record[offset + j] = if j == 0 { 255 } else { j as u8 };
+            }
+        }
         let first = chrono::DateTime::parse_from_rfc3339("2026-10-20T14:09:07.123456700Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -553,6 +571,13 @@ mod tests {
             assert_eq!(&row[11], "77");
             assert_eq!(&row[12], "0");
             assert_eq!(&row[16], "", "Non-finite values must remain blank");
+            assert_eq!(row.len(), crate::waveline::CSV_HEADER.len());
+            for (column, offset, length) in
+                [(24, 180, 72), (25, 356, 60), (26, 424, 128), (27, 668, 128)]
+            {
+                let samples: Vec<u8> = serde_json::from_str(&row[column]).unwrap();
+                assert_eq!(samples, record[offset..offset + length]);
+            }
         }
         assert_eq!(&rows[0][4], "0");
         assert_eq!(&rows[1][4], "1956");
@@ -588,6 +613,35 @@ mod tests {
             assert_eq!(row[3].parse::<f64>().unwrap(), received_elapsed);
             assert_eq!(&row[15], "transport_read_completion");
         }
+        let mut all = csv::Reader::from_path(exports.join("waveline_readings.csv")).unwrap();
+        let names = all.headers().unwrap().clone();
+        let rows: Vec<_> = all.records().map(Result::unwrap).collect();
+        assert_eq!(rows.len(), 2);
+        let wave_column = names
+            .iter()
+            .position(|n| n == "ecg_raw_samples_json")
+            .unwrap();
+        let rate_column = names
+            .iter()
+            .position(|n| n == "ecg_samples_per_receipt_second_estimate")
+            .unwrap();
+        for row in rows {
+            assert_eq!(
+                serde_json::from_str::<Vec<u8>>(&row[wave_column]).unwrap(),
+                record[180..252]
+            );
+            assert_eq!(
+                &row[rate_column], "",
+                "Batched records must not establish a sampling rate"
+            );
+        }
+        assert_eq!(
+            csv::Reader::from_path(exports.join("waveline_waveforms.csv"))
+                .unwrap()
+                .records()
+                .count(),
+            2 * 388
+        );
         assert_eq!(read_csv().len(), 2, "Stopping must not duplicate live rows");
     }
 }
