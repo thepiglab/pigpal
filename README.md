@@ -4,6 +4,22 @@ A Rust desktop app for the **Waveline Pro** patient monitor. Pig Pal receives
 monitor data over Ethernet, displays decoded readings in a Waveline-style view,
 and saves the complete incoming stream alongside timestamped CSVs.
 
+<p align="center">
+  <img src="docs/media/replay.gif" alt="Replaying a saved Waveline Pro session in Pig Pal: ECG, pleth and arterial traces sweep while the note banner switches to “carotid blood sample drawn” as playback reaches it" width="900">
+</p>
+<p align="center"><sub>Replaying a saved session in the Waveline view. Notes taken during surgery appear on the timeline and jump the monitor to that moment.</sub></p>
+
+- **Records everything:** raw monitor bytes, decoded vitals, notes, markers and
+  optional microphone audio. Capture keeps running when the window is hidden,
+  minimized or unfocused.
+- **Waveline view:** a live layout modeled on the device screen, plus replay of
+  any saved session with notes and markers on the timeline.
+- **Local and offline:** data stays on the laptop; transcription runs offline.
+
+| Live recording | Saved session | Light mode |
+|---|---|---|
+| ![Live recording with vitals, trend, microphone and markers](docs/media/05_live.png) | ![Saved session timeline with notes and replay buttons](docs/media/02_review.png) | ![The saved session in light mode](docs/media/06_review_light.png) |
+
 ```text
 Waveline Pro -- Ethernet / TCP --> Pig Pal
                                    |-- live monitor view

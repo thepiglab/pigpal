@@ -128,3 +128,54 @@ fn snapshots() {
     shoot(&mut h, &out, "05_live");
     h.state_mut().stop(false);
 }
+
+/// Frames for the README animation: pig 6 replay playing through a note.
+/// `PIGPAL_GIF_DIR=/tmp/frames PIGPAL_SNAPSHOT_DATA=… cargo test --release --lib replay_gif -- --ignored`
+#[test]
+#[ignore = "writes PNG frames; run explicitly"]
+fn replay_gif_frames() {
+    let out = PathBuf::from(std::env::var("PIGPAL_GIF_DIR").expect("PIGPAL_GIF_DIR"));
+    std::fs::create_dir_all(&out).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    copy_dir(Path::new(&std::env::var("PIGPAL_SNAPSHOT_DATA").unwrap()), temp.path());
+    let root = Root::open(temp.path().to_path_buf()).unwrap();
+    let mut h = Harness::builder()
+        .wgpu()
+        .with_size(Vec2::new(1280.0, 800.0))
+        .with_pixels_per_point(1.5)
+        .with_max_steps(8)
+        .build_eframe(move |cc| Desktop::new(cc, root));
+    theme::set_appearance(&h.ctx, Appearance::Dark);
+    let id = h
+        .state()
+        .sessions
+        .iter()
+        .find(|s| s.subject == "pig 6")
+        .map(|s| s.id.clone())
+        .expect("pig 6 session");
+    h.state_mut().open_replay(id, None);
+    settle(&mut h, |d| d.replay.is_some() && d.job.is_none());
+    let start: chrono::DateTime<chrono::Utc> = h
+        .state()
+        .replay
+        .as_ref()
+        .unwrap()
+        .notes()
+        .iter()
+        .find(|n| n.text.contains("carotid"))
+        .map(|n| n.at)
+        .unwrap()
+        - chrono::Duration::milliseconds(4000);
+    for i in 0..90 {
+        let at = start + chrono::Duration::milliseconds(i * 100);
+        {
+            let d = h.state_mut();
+            d.toasts.clear();
+            d.replay.as_mut().unwrap().freeze_at(at, true);
+        }
+        h.step();
+        h.step();
+        let image = h.render().expect("render");
+        image.save(out.join(format!("frame_{i:03}.png"))).unwrap();
+    }
+}

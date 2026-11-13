@@ -74,6 +74,14 @@ impl Viewer {
         viewer.sync_input();
         viewer
     }
+    /// Test helper: place the cursor and show the playing state without the
+    /// wall clock advancing it, so rendered frames are deterministic.
+    #[cfg(test)]
+    pub fn freeze_at(&mut self, at: DateTime<Utc>, playing: bool) {
+        self.jump(at);
+        self.player.playing = playing;
+        self.last_tick = Instant::now() + std::time::Duration::from_secs(3600);
+    }
     /// Move the cursor to `at`, clamped to the recorded range, and pause there so
     /// the monitor shows the vitals at that moment.
     pub fn jump(&mut self, at: DateTime<Utc>) {

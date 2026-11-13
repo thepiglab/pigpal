@@ -46,6 +46,8 @@ Appearance: System / Light / Dark in the sidebar footer, saved in `settings.json
 
 Notes in replay: markers and notes appear as ticks on the scrubber, as a banner naming the note at the current moment, and as a clickable list beside the monitor. Clicking any of them, using ⏴ Note / Note ⏵, or pressing `[` / `]` jumps to that moment and pauses there, so the monitor shows the vitals at that time. A note is placed at the time it was opened. Each note on the saved-session timeline has a ⏵ Replay button that opens the replay at that moment.
 
+README animation (`docs/media/replay.gif`): `PIGPAL_GIF_DIR=<frames> PIGPAL_SNAPSHOT_DATA=<copy of a data dir> cargo test --release --lib replay_gif -- --ignored`, then encode the frames at 10 fps with an ffmpeg palette (`palettegen=max_colors=256`, `paletteuse=dither=bayer:bayer_scale=5`, scaled to 1000 px wide).
+
 Headless screenshots of every screen: `PIGPAL_SNAPSHOT_DIR=<out> PIGPAL_SNAPSHOT_DATA=<copy of a data dir> cargo test --release --lib snapshots -- --ignored` (copies the data again into a temporary folder; originals are never opened for writing).
 
 ---
