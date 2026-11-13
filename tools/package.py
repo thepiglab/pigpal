@@ -13,13 +13,17 @@ arch={'amd64':'x64','x86_64':'x64','aarch64':'arm64','arm64':'arm64'}.get(platfo
 subprocess.run(['cargo','build','--release','--locked'],check=True,cwd=ROOT)
 dist=args.output_dir.resolve();dist.mkdir(parents=True,exist_ok=True)
 if platform.system()=='Darwin':
-    app=dist/'Pig Pal.app';mac=app/'Contents/MacOS';mac.mkdir(parents=True,exist_ok=True)
+    # Start from an empty bundle so files from earlier builds never linger.
+    app=dist/'Pig Pal.app';shutil.rmtree(app,ignore_errors=True)
+    mac=app/'Contents/MacOS';mac.mkdir(parents=True,exist_ok=True)
     resources=app/'Contents/Resources';resources.mkdir(parents=True,exist_ok=True)
     for old_notice in mac.glob('*LICENSE.txt'):
         shutil.move(str(old_notice),str(resources/old_notice.name))
     shutil.copy2(ROOT/'target/release/pigpal',mac/'pigpal')
     for path in (ROOT/'bin').iterdir():
-        if path.is_dir():shutil.copytree(path,mac/path.name,dirs_exist_ok=True)
+        # Resource bundles (e.g. FluidAudio's) are data, not code: they belong in
+        # Resources. In MacOS, codesign rejects them when they lack an Info.plist.
+        if path.is_dir():shutil.copytree(path,resources/path.name,dirs_exist_ok=True)
         else:
             destination=(resources if path.suffix=='.txt' else mac)/path.name
             if destination.exists():destination.chmod(0o755 if path.suffix!='.txt' else 0o644)
@@ -35,7 +39,12 @@ if platform.system()=='Darwin':
           'NSMicrophoneUsageDescription':'Record audio only when you explicitly start the microphone in a session.',
           'NSCameraUsageDescription':'Record the video input you explicitly select for a session.'}
     (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-    subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
+    # Ad-hoc sign each helper executable, then the app itself (inside out, without --deep).
+    for helper in sorted(mac.iterdir()):
+        if helper.is_file() and helper.name!='pigpal':
+            subprocess.run(['codesign','--force','--sign','-',str(helper)],check=True)
+    subprocess.run(['codesign','--force','--sign','-',str(app)],check=True)
+    subprocess.run(['codesign','--verify','--deep','--strict',str(app)],check=True)
     print(app)
     if args.dmg:
         # A plain disk image holding the app beside an Applications shortcut.
