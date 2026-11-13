@@ -353,7 +353,12 @@ fn finish(
 ) -> Result<()> {
     if let Some((writer, mut clip)) = current.take() {
         writer.finalize()?;
-        File::open(dir.join(&clip.file))?.sync_all()?;
+        // Flushing needs a writable handle on Windows (FlushFileBuffers);
+        // a read-only handle fails there with "Access is denied".
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(&clip.file))?
+            .sync_all()?;
         clip.duration_s = clip.frames as f64 / clip.sample_rate as f64;
         clip.state = "closed".into();
         write_json(&dir.join(format!("{}.json", clip.file)), &clip)?;
