@@ -30,6 +30,16 @@ The speech helper uses Swift and Core ML. Python runs the build/packaging script
 
 The package is locally ad-hoc signed. It is not Developer ID notarized for distribution to other Macs. Local validation has been performed on macOS; Windows/Linux builds are supplied but have not been validated on hardware.
 
+## Releases
+
+GitHub Actions (`.github/workflows/build.yml`) tests every push and pull request on macOS,
+Windows and Linux and packages the macOS DMG and Windows ZIP as run artifacts. A push to `main`
+whose `Cargo.toml` version has no release yet publishes one: it tags `v<version>` and attaches
+both packages with the notes in `.github/release-notes.md`. To release, bump `version` in
+`Cargo.toml` and merge to `main`.
+
+Locally, `python3 tools/package.py --dmg` builds the same `PigPal-<version>-macos-arm64.dmg`.
+
 ## Windows and Linux
 
 The portable speech helper uses CMake and a C++17 compiler. Windows builds require Rust MSVC, Visual Studio C++ build tools, Git, CMake, and Python.

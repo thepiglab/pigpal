@@ -1,27 +1,111 @@
-name: Desktop
-on: [push, pull_request, workflow_dispatch]
+# Every push and pull request: test on macOS, Windows and Linux, and package the macOS and
+# Windows apps (downloadable from the run's artifacts).
+# A push to main whose Cargo.toml version has no release yet also publishes one: it tags
+# v<version> and attaches the macOS .dmg and the Windows .zip. To release, bump the version in
+# Cargo.toml and push (or merge) to main.
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/screenshots/**', 'docs/media/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/screenshots/**', 'docs/media/**']
+  workflow_dispatch:
+
+# A newer push cancels the older run, except on main, where a run that has started is left to
+# finish (it may be publishing a release) and only one still waiting to start is replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Debug info only slows test linking.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
 jobs:
-  test-and-package:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, windows-latest, ubuntu-24.04]
-    runs-on: ${{ matrix.os }}
+  macos:
+    # Apple silicon runner. The speech helper needs macOS 15 and Xcode's Swift toolchain.
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.88.0'
-      - uses: actions/setup-python@v5
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - name: Build speech helper
+        run: python3 tools/build-speech.py
+      - name: Package
+        run: python3 tools/package.py --dmg
+      - uses: actions/upload-artifact@v7
         with:
-          python-version: '3.12'
-      - name: Linux dependencies
-        if: runner.os == 'Linux'
+          name: macos
+          path: dist/*.dmg
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - name: Build speech helper
+        run: python tools/build-speech.py
+      - name: Package
+        run: python tools/package.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*.zip
+
+  linux:
+    # Tests only: keeps the Linux build working without publishing it.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
       - run: cargo test --locked
-      - run: python tools/build-speech.py
-      - run: python tools/package.py
-      - uses: actions/upload-artifact@v4
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Is this version released yet?
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.new == 'true'
+        uses: actions/download-artifact@v8
         with:
-          name: PigPal-${{ matrix.os }}
-          path: dist/
+          path: dist
+          merge-multiple: true
+      - if: steps.version.outputs.new == 'true'
+        name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "Pig Pal ${TAG#v}" --notes-file .github/release-notes.md

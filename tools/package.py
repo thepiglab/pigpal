@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Package the compiled native application without modifying the iPad project."""
 from pathlib import Path
-import argparse, platform, plistlib, shutil, subprocess
+import argparse, platform, plistlib, re, shutil, subprocess
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--output-dir',type=Path,default=ROOT/'dist',help='Package separately without replacing a running app')
+parser.add_argument('--dmg',action='store_true',help='macOS: also build a drag-to-Applications disk image')
 args=parser.parse_args()
+# Release file names and the app's version both come from Cargo.toml.
+version=re.search(r'^version\s*=\s*"([^"]+)"',(ROOT/'Cargo.toml').read_text(),re.M).group(1)
+arch={'amd64':'x64','x86_64':'x64','aarch64':'arm64','arm64':'arm64'}.get(platform.machine().lower(),platform.machine().lower())
 subprocess.run(['cargo','build','--release','--locked'],check=True,cwd=ROOT)
 dist=args.output_dir.resolve();dist.mkdir(parents=True,exist_ok=True)
 if platform.system()=='Darwin':
@@ -26,13 +30,24 @@ if platform.system()=='Darwin':
     shutil.copy2(ROOT/'assets/fonts/LICENSE.txt',resources/'Inter-LICENSE.txt')
     shutil.copy2(ROOT/'third_party/cpal/LICENSE',resources/'CPAL-LICENSE.txt')
     info={'CFBundleName':'Pig Pal','CFBundleDisplayName':'Pig Pal','CFBundleIdentifier':'org.research.pigpal.desktop',
-          'CFBundleExecutable':'pigpal','CFBundleVersion':'1','CFBundleShortVersionString':'0.1.0',
+          'CFBundleExecutable':'pigpal','CFBundleVersion':version,'CFBundleShortVersionString':version,
           'CFBundlePackageType':'APPL','LSMinimumSystemVersion':'15.0','NSHighResolutionCapable':True,
           'NSMicrophoneUsageDescription':'Record audio only when you explicitly start the microphone in a session.',
           'NSCameraUsageDescription':'Record the video input you explicitly select for a session.'}
     (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     subprocess.run(['codesign','--force','--deep','--sign','-',str(app)],check=True)
     print(app)
+    if args.dmg:
+        # A plain disk image holding the app beside an Applications shortcut.
+        staging=dist/'dmg-staging'
+        shutil.rmtree(staging,ignore_errors=True);staging.mkdir()
+        shutil.copytree(app,staging/app.name,symlinks=True)
+        (staging/'Applications').symlink_to('/Applications')
+        dmg=dist/f'PigPal-{version}-macos-{arch}.dmg';dmg.unlink(missing_ok=True)
+        subprocess.run(['hdiutil','create','-volname','Pig Pal','-srcfolder',str(staging),
+                        '-fs','HFS+','-format','UDZO','-ov',str(dmg)],check=True)
+        shutil.rmtree(staging)
+        print(dmg)
 else:
     dest=dist/'PigPal';dest.mkdir(exist_ok=True)
     ext='.exe' if platform.system()=='Windows' else ''
@@ -43,5 +58,5 @@ else:
     shutil.copytree(ROOT/'docs',dest/'docs',dirs_exist_ok=True)
     shutil.copy2(ROOT/'assets/fonts/LICENSE.txt',dest/'Inter-LICENSE.txt')
     shutil.copy2(ROOT/'third_party/cpal/LICENSE',dest/'CPAL-LICENSE.txt')
-    shutil.make_archive(str(dist/f'PigPal-{platform.system()}-{platform.machine()}'),'zip',dest)
+    shutil.make_archive(str(dist/f'PigPal-{version}-{platform.system().lower()}-{arch}'),'zip',dest)
     print(dest)

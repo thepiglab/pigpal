@@ -16,6 +16,17 @@ and saves the complete incoming stream alongside timestamped CSVs.
   any saved session with notes and markers on the timeline.
 - **Local and offline:** data stays on the laptop; transcription runs offline.
 
+## Download
+
+Get the latest build from **[Releases](https://github.com/thepiglab/pigpal/releases/latest)**:
+
+- **macOS** (Apple silicon, macOS 15+): `PigPal-*-macos-arm64.dmg`. Open it and drag **Pig Pal** into Applications.
+- **Windows** (64-bit): `PigPal-*-windows-x64.zip`. Unzip and run `PigPal.exe`.
+
+The builds are not signed with a paid developer certificate. On first launch, macOS asks you to allow
+the app in **System Settings → Privacy & Security → Open Anyway**; on Windows, choose
+**More info → Run anyway**. To build from source instead, see [Build and run](#build-and-run).
+
 | Live recording | Saved session | Light mode |
 |---|---|---|
 | ![Live recording with vitals, trend, microphone and markers](docs/media/05_live.png) | ![Saved session timeline with notes and replay buttons](docs/media/02_review.png) | ![The saved session in light mode](docs/media/06_review_light.png) |
