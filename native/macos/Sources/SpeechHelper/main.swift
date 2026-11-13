@@ -1,5 +1,7 @@
 import Foundation
-import CoreML
+// Core ML predates Sendable annotations; older Swift 6 compilers (Xcode 16)
+// otherwise reject passing its MLModel values across concurrency domains.
+@preconcurrency import CoreML
 import FluidAudio
 
 // A small platform adapter. The Rust app owns sessions, original audio and transcripts.
